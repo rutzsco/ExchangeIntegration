@@ -1,0 +1,44 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+artifacts/
+publish/
+
+# Test results and coverage
+TestResults/
+*.trx
+coverage/
+*.coverage
+*.coveragexml
+coverage.cobertura.xml
+
+# IDE and user-specific files
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userprefs
+*.DotSettings.user
+
+# Local configuration. Real Exchange endpoints, mailboxes and identities must never be committed.
+# Only appsettings.json (placeholders) is tracked; environment-specific overrides stay local.
+appsettings.*.json
+*.local.json
+secrets.json
+.env
+.env.*
+
+# Logs and diagnostics captures
+*.log
+*.etl
+*.cap
+*.pcap
+*.pcapng
+*.saz
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store

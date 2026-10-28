@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="ExchangeIntegration.csproj" />
+  <Project Path="ExchangeIntegration.Tests/ExchangeIntegration.Tests.csproj" />
+</Solution>
