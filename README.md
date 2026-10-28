@@ -1,4 +1,4 @@
-# Exchange Integration Service - Milestone 1: EWS connectivity and Windows authentication probe
+# Exchange Integration Service
 
 A small .NET 10 application that proves, against an **on-premises Exchange Server Subscription Edition (SE)**, that
 
