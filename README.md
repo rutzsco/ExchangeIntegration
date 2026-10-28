@@ -37,8 +37,8 @@ concept is implemented here.** Do not start on ingestion or sending until this p
   the .NET 10 runtime to run published output.
 - **An Exchange Server SE EWS endpoint** reachable over HTTPS, normally `https://<exchange-host>/EWS/Exchange.asmx`,
   with a certificate the host trusts and whose names cover `<exchange-host>`.
-- **An identity to authenticate as.** The dedicated Active Directory service identity (potentially a group Managed
-  Service Account, gMSA) that the service will eventually run as, or an approved development identity.
+- **An identity to authenticate as.** The dedicated Active Directory service identity that the service will eventually
+  run as, or an approved development identity.
 - **EWS enabled for that identity**: not switched off or blocked by an EWS access policy or throttling policy.
 - **Mailbox permissions**: the identity must be allowed to see the target mailbox's Inbox (see
   [Exchange administrator checklist](#exchange-administrator-checklist)).
@@ -91,6 +91,11 @@ $env:Exchange__Mailbox = "<approved-mailbox>@<your-domain>"
 dotnet run -- --probe
 $LASTEXITCODE            # 0 only when the probe succeeded
 ```
+
+The probe runs as the Windows identity of the process you start it from and prints it as `Windows Identity`. There is
+deliberately no setting for an identity, user name or password. To probe as another account, such as the dedicated
+service account, start the process as that account; see
+[Run the probe under the intended identity](#run-the-probe-under-the-intended-identity).
 
 A published build runs the same way: `dotnet publish -c Release -o <folder>`, then `<folder>\ExchangeIntegration.exe --probe`.
 
@@ -175,34 +180,54 @@ Overall: FAILURE (exit code 5)
 
 ### Run the probe under the intended identity
 
-The probe authenticates as the **Windows identity of the process** and prints it as `Windows Identity`. **A successful
-run under a developer's personal identity does not establish that the eventual Windows service or gMSA will work**:
-mailbox permissions, EWS policies, Kerberos SPNs, network paths and the certificate trust of the host can all differ.
-Repeat the probe as the real identity, on the real host, before relying on it.
+There is deliberately **no setting for an identity, user name or password**: nothing in `appsettings.json`, an
+environment variable or a command-line argument selects one, and the probe never asks for credentials. It authenticates
+as the **Windows identity of the process** and prints it as `Windows Identity`. To probe as another account, start the
+process as that account.
+
+**A successful run under a developer's personal identity does not establish that the eventual Windows service identity
+will work**: mailbox permissions, EWS policies, Kerberos SPNs, network paths and the certificate trust of the host can
+all differ. Repeat the probe as the real identity, on the real host, before relying on it.
 
 1. **Development identity.** `dotnet run -- --probe` as the signed-in user. Useful for URL, certificate and mailbox
    configuration; says nothing about the service identity.
-2. **A dedicated service account with a known password.** Start a session as that account, for example
-   `runas /user:CONTOSO\svc-invoiceews cmd` (if policy denies interactive logon, use a scheduled task instead), and run
-   the published executable from it. **Do not use `runas /netonly`**: it changes the credentials used for network
-   authentication but not the process identity, so the identity the probe prints would no longer be the identity Exchange sees.
-3. **A gMSA.** A gMSA has no known password, so `runas` cannot be used. Run the probe from a scheduled task whose
-   principal is the gMSA (an administrator adapts this and removes the task afterwards; the output goes to a file because a
-   scheduled task has no console):
+2. **A dedicated service account with a known password.** Publish once, then use `runas` to start a command prompt as
+   that account and run the published executable from it:
 
    ```powershell
-   $exe       = 'C:\Apps\ExchangeIntegration\ExchangeIntegration.exe'
-   $action    = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument "/c `"$exe`" --probe > C:\Apps\ExchangeIntegration\probe.txt 2>&1" -WorkingDirectory 'C:\Apps\ExchangeIntegration'
-   $principal = New-ScheduledTaskPrincipal -UserId 'CONTOSO\svc-invoiceews$' -LogonType Password
-   Register-ScheduledTask -TaskName 'ExchangeIntegration-Probe' -Action $action -Principal $principal
-   Start-ScheduledTask -TaskName 'ExchangeIntegration-Probe'
-   Get-Content C:\Apps\ExchangeIntegration\probe.txt
-   (Get-ScheduledTaskInfo -TaskName 'ExchangeIntegration-Probe').LastTaskResult      # the probe's exit code
-   Unregister-ScheduledTask -TaskName 'ExchangeIntegration-Probe' -Confirm:$false
+   # As yourself, once: publish to a folder that the service account can read and execute.
+   dotnet publish -c Release -o C:\Apps\ExchangeIntegration
+
+   # Start a command prompt as the service account. Type its password at the prompt.
+   runas /user:CONTOSO\svc-invoiceews cmd
    ```
 
-   The gMSA must be installed on the host (`Install-ADServiceAccount`, `Test-ADServiceAccount` returns `True`), allowed to
-   log on as a batch job, and have write access to the output folder.
+   In the new command prompt, which runs as that account:
+
+   ```bat
+   whoami
+   cd /d C:\Apps\ExchangeIntegration
+   ExchangeIntegration.exe --probe --Exchange:EwsUrl=https://<your-exchange-host>/EWS/Exchange.asmx --Exchange:Mailbox=<approved-mailbox>@<your-domain>
+   echo %ERRORLEVEL%
+   ```
+
+   - **Confirm the identity.** `whoami` must print the account you intended (for example `contoso\svc-invoiceews`) and
+     the probe's `Windows Identity:` line must name the same account (the case can differ). If either shows your own
+     account, or they disagree, stop: the result does not describe the service account.
+   - **Settings do not carry over.** `runas` starts the account's own environment, not that of the shell you ran it from
+     (unless you pass `/env`), so `$env:Exchange__EwsUrl` and `$env:Exchange__Mailbox` set in your shell are **not**
+     visible there. In the new prompt, set them again (`set Exchange__EwsUrl=...`), edit `appsettings.json` in the
+     published folder, or pass `--Exchange:EwsUrl=...` and `--Exchange:Mailbox=...` as shown above.
+   - **Access to the folder.** The account needs read and execute access to the published folder, so do not publish into
+     your own profile folder.
+   - **Do not use `runas /netonly`.** It changes the credentials used for network authentication but not the process
+     identity, so the identity the probe prints would no longer be the identity Exchange sees. Avoid `/savecred` too: it
+     stores the account's password where anything running as you can reuse it.
+   - **If the account cannot log on to this machine** (for example it belongs to a domain with no trust, or policy denies
+     it interactive logon, which is often done deliberately for service accounts), `runas` cannot start the prompt. Run
+     the probe on a host that can log on the account, or have an administrator run it as that account by an approved
+     method, such as a scheduled task that writes the output to a file. Never put the password in a script or on a
+     command line.
 
 ## Kerberos versus NTLM
 
@@ -220,7 +245,7 @@ approves, for example:
    Run the probe, then on the Exchange server (an administrator, with logon auditing enabled):
 
    ```powershell
-   $xpath = "*[System[EventID=4624]] and *[EventData[Data[@Name='TargetUserName']='svc-invoiceews`$']]"
+   $xpath = "*[System[EventID=4624]] and *[EventData[Data[@Name='TargetUserName']='svc-invoiceews']]"
    Get-WinEvent -LogName Security -FilterXPath $xpath -MaxEvents 20 | ForEach-Object {
        $data = ([xml]$_.ToXml()).Event.EventData.Data
        [pscustomobject]@{
@@ -239,9 +264,9 @@ approves, for example:
    `ExchangeIntegration-EwsProbe/1.0` and read `cs-username`, `sc-status`, `sc-substatus`. On a new connection Kerberos
    typically shows one 401 challenge followed by 200, NTLM shows an extra 401 round trip. This is only an indication,
    because connection reuse changes the pattern.
-4. **Client ticket cache.** `klist` in the identity's own session lists a `HTTP/<ews-host>` service ticket after a
-   Kerberos-authenticated call (`klist purge` first for a clean test). A service or gMSA session cannot be inspected from an
-   interactive session, so use the server-side evidence for those.
+4. **Client ticket cache.** `klist` in the identity's own session (for example the `runas` prompt described above) lists
+   a `HTTP/<ews-host>` service ticket after a Kerberos-authenticated call (`klist purge` first for a clean test). The
+   session of a Windows service cannot be inspected from an interactive session, so use the server-side evidence for it.
 5. **SPN check.** `setspn -Q HTTP/<ews-host>` should return exactly one account; `setspn -X` finds duplicates. Kerberos
    works only for host names that have an SPN, so use the same name in `Exchange:EwsUrl`.
 
@@ -268,14 +293,14 @@ for the Exchange administrator, using the customer's change process for any fix.
 3. **Delegated mailbox or folder permissions.** `GetFolder` on the Inbox succeeds only if the identity may see that folder.
 
    ```powershell
-   Get-MailboxPermission -Identity ap-invoices@contoso.com -User 'CONTOSO\svc-invoiceews$' | Format-List User, AccessRights, IsInherited, Deny
+   Get-MailboxPermission -Identity ap-invoices@contoso.com -User 'CONTOSO\svc-invoiceews' | Format-List User, AccessRights, IsInherited, Deny
    Get-MailboxFolderPermission -Identity 'ap-invoices@contoso.com:\Inbox'
    ```
 
-   For a gMSA the sAMAccountName ends in `$`. Folder-level permissions can typically be granted only to mail-enabled
-   principals (a mailbox, mail user or mail-enabled security group), whereas Full Access can be granted to any security
-   principal such as a service account; agree the model with the customer. Later milestones need more rights than this
-   one (read, move or copy, and send each need their own), so decide those before building them.
+   Folder-level permissions can typically be granted only to mail-enabled principals (a mailbox, mail user or
+   mail-enabled security group), whereas Full Access can be granted to any security principal such as a service account;
+   agree the model with the customer. Later milestones need more rights than this one (read, move or copy, and send each
+   need their own), so decide those before building them.
 4. **EWS access policies.** EWS can be switched off, or restricted to allow/block lists matched against the client
    **User-Agent**. Check the organization and both the service identity and the target mailbox. The probe sends
    `User-Agent: ExchangeIntegration-EwsProbe/1.0`. Also review the throttling policy applied to the service identity.
@@ -294,10 +319,7 @@ for the Exchange administrator, using the customer's change process for any fix.
 
    Decide whether NTLM is acceptable as a fallback, or whether it must be disabled for this identity.
 6. **Unattended service account eligibility.** The identity must be able to authenticate with no person present:
-   - a gMSA is preferred; for a gMSA, the host must be allowed to retrieve the password
-     (`Get-ADServiceAccount -Identity svc-invoiceews -Properties PrincipalsAllowedToRetrieveManagedPassword`) and
-     `Test-ADServiceAccount svc-invoiceews` must return `True` on the host;
-   - for an ordinary account: enabled, password that does not expire unexpectedly, no smart card required, no logon-hour
+   - the account: enabled, password that does not expire unexpectedly, no smart card required, no logon-hour
      restriction, and not a member of the Protected Users group (it blocks NTLM);
    - the right to log on as a service (the future service) or as a batch job (a scheduled-task test) on the host;
    - clocks within the Kerberos tolerance (5 minutes by default) of the domain, and HTTPS (TCP 443) reachable from the host.
@@ -419,6 +441,10 @@ ExchangeIntegration.Tests/      xUnit tests (mocked HTTP transport, loopback ser
 Email synchronization or polling; reading message bodies or attachments; Azure Blob Storage; moving or copying email;
 sending email or replies; Microsoft Graph; IMAP or SMTP; OAuth; Service Bus; database persistence; Windows Service
 installation or deployment automation; Exchange administration changes.
+
+Deferred for now: running under a group Managed Service Account (gMSA). It is not documented or tested in this
+milestone. The application does not select or restrict the identity (it uses the identity of the process), so this is a
+scope decision for the documentation, not a limitation enforced by the code.
 
 ## Recommended next step
 
