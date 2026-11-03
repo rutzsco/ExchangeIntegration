@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Exchange Adapter ↔ AI Workflow Engine — Short design</title>
+<meta name="description" content="A short design for connecting the on-premises Exchange adapter to the cloud AI workflow engine: invoice emails go to Blob Storage and Service Bus, and commands come back to email the sender and move messages.">
+<style>
+:root{
+  color-scheme:light dark;
+  --bg:#f4f6fa; --surface:#ffffff; --soft:#eef2f8; --zebra:#f7f9fc; --ink:#1a2330; --muted:#566377; --line:#d9e0ea;
+  --brand:#0a58a8; --link:#0a58a8; --on-brand:#ffffff;
+  --warn:#fff5e1; --warn-b:#d9a030;
+  --code-bg:#101826; --code-ink:#e4ecf7;
+  --z-onprem:#fff7e8; --z-azure:#eaf3fd; --box:#ffffff; --box-line:#7f93ab; --arrow:#3b5675;
+  --mono:ui-monospace,"Cascadia Code","Cascadia Mono",Consolas,Menlo,monospace;
+  --sans:"Segoe UI Variable","Segoe UI",system-ui,-apple-system,"Helvetica Neue",Arial,sans-serif;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#0d131b; --surface:#141c27; --soft:#1a2432; --zebra:#172130; --ink:#e7edf5; --muted:#9fb0c5; --line:#27354a;
+    --brand:#6bb2ff; --link:#7dbbff; --on-brand:#0d131b;
+    --warn:#3a2e12; --warn-b:#b98a2c;
+    --code-bg:#0a0f17;
+    --z-onprem:#2a2214; --z-azure:#132337; --box:#1b2636; --box-line:#6b829d; --arrow:#9db6d3;
+  }
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 var(--sans)}
+a{color:var(--link)}
+a:focus-visible,.scroll:focus-visible{outline:3px solid var(--brand);outline-offset:2px;border-radius:4px}
+
+.paper{max-width:900px;margin:24px auto;background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:30px 38px 24px}
+.eyebrow{margin:0 0 4px;font-size:12.5px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+h1{margin:0 0 12px;font-size:30px;line-height:1.2}
+.callout{margin:0;padding:9px 14px;border-left:5px solid var(--warn-b);border-radius:8px;background:var(--warn)}
+.callout p{margin:0}
+
+section{margin-top:24px}
+h2{margin:0 0 10px;padding-top:14px;border-top:1px solid var(--line);font-size:20px;line-height:1.3;break-after:avoid}
+h2 .num{margin-right:8px;color:var(--brand)}
+p{margin:0 0 10px}
+ul,ol{margin:0 0 10px;padding-left:22px}
+code{font:.9em var(--mono);padding:1px 5px;border:1px solid var(--line);border-radius:5px;background:var(--soft);overflow-wrap:break-word}
+.small{font-size:13.5px;color:var(--muted)}
+
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin:12px 0 0}
+.card{padding:9px 12px;border:1px solid var(--line);border-radius:10px;background:var(--soft)}
+.card b{display:block;margin-bottom:2px;font-size:14.5px;line-height:1.3}
+.card span{font-size:13.5px;line-height:1.4;color:var(--muted)}
+
+figure{margin:10px 0 0;overflow-x:auto}
+figure svg{display:block;width:100%;min-width:640px;height:auto;border:1px solid var(--line);border-radius:12px;background:var(--surface)}
+figcaption{margin-top:6px;font-size:13px;color:var(--muted)}
+
+ol.steps{margin:6px 0 0;padding:0;list-style:none}
+ol.steps li{position:relative;margin:0 0 8px;padding-left:34px}
+ol.steps li::before{content:attr(data-n);position:absolute;left:0;top:1px;width:22px;height:22px;border-radius:50%;background:var(--brand);color:var(--on-brand);font:700 12.5px/22px var(--sans);text-align:center}
+
+.table-wrap{overflow-x:auto;margin:8px 0 10px}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{padding:6px 9px;border:1px solid var(--line);vertical-align:top;text-align:left}
+th{background:var(--soft);font-weight:700}
+tbody tr:nth-child(even){background:var(--zebra)}
+.msgs td:nth-child(2){white-space:nowrap}
+.further td:first-child{width:2.4em;text-align:right;color:var(--muted)}
+.further td:nth-child(2){width:11em;font-weight:700}
+
+.pair{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
+.pair>div{min-width:0}
+.pair p{margin:0 0 4px;font-size:12.5px;font-weight:700;color:var(--muted)}
+pre{margin:0;padding:10px 12px;overflow:auto;border-radius:9px;background:var(--code-bg);color:var(--code-ink);font:12px/1.5 var(--mono);tab-size:2}
+pre code{padding:0;border:0;background:none;color:inherit;font:inherit;overflow-wrap:normal}
+.sources{margin:16px 0 0;padding-top:10px;border-top:1px solid var(--line)}
+
+.svg-ah{fill:var(--arrow)}
+.svg-zone{fill:var(--z-onprem);stroke:var(--box-line);stroke-width:1.5;stroke-dasharray:7 5}
+.svg-zone.az{fill:var(--z-azure)}
+.svg-zl{fill:var(--muted);font:700 12px var(--sans);letter-spacing:.08em}
+.svg-box{fill:var(--box);stroke:var(--box-line);stroke-width:1.5}
+.svg-box.hl{stroke:var(--brand);stroke-width:2.2}
+.svg-chip{fill:var(--soft);stroke:var(--box-line);stroke-width:1.2}
+.svg-t{fill:var(--ink);font:700 15px var(--sans)}
+.svg-s{fill:var(--muted);font:13px var(--sans)}
+.svg-m{fill:var(--ink);font:13px var(--sans)}
+.svg-mb{fill:var(--ink);font:700 13.5px var(--sans)}
+.svg-a{stroke:var(--arrow);stroke-width:2;fill:none}
+.svg-a.d{stroke-dasharray:6 4}
+.svg-b{fill:var(--brand)}
+.svg-bt{fill:var(--on-brand);font:700 13px var(--sans);text-anchor:middle}
+
+@media (max-width:640px){
+  .paper{margin:0;padding:22px 16px;border:0;border-radius:0}
+  .pair{grid-template-columns:1fr}
+  h1{font-size:25px}
+}
+
+@page{margin:.55in}
+@media print{
+  :root{
+    --bg:#ffffff; --surface:#ffffff; --soft:#eef2f8; --zebra:#f7f9fc; --ink:#1a2330; --muted:#4a586b; --line:#c9d2de;
+    --brand:#0a58a8; --link:#0a58a8; --on-brand:#ffffff;
+    --warn:#fff5e1; --warn-b:#d9a030;
+    --code-bg:#101826; --code-ink:#e4ecf7;
+    --z-onprem:#fff7e8; --z-azure:#eaf3fd; --box:#ffffff; --box-line:#7f93ab; --arrow:#3b5675;
+  }
+  body{background:#fff;color:#000;font-size:10pt;line-height:1.42;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  .paper{max-width:none;margin:0;padding:0;border:0;border-radius:0;background:none}
+  h1{margin-bottom:8px;font-size:21pt}
+  .callout{padding:6px 12px}
+  h2{margin-bottom:6px;padding-top:9px;font-size:13pt}
+  section{margin-top:13px;break-inside:avoid}
+  p,ul,ol{margin-bottom:6px}
+  .small{font-size:8.8pt}
+  .cards{gap:8px;margin-top:8px}
+  .card{padding:6px 9px}
+  .card b{font-size:9.6pt}
+  .card span{font-size:8.8pt}
+  figcaption{font-size:8.8pt}
+  ol.steps li{margin-bottom:4px}
+  table{font-size:8.8pt}
+  th,td{padding:3px 7px}
+  pre{padding:6px 9px;font-size:7.8pt}
+  .pair p{font-size:8.5pt}
+  figure,.table-wrap,pre{overflow:visible}
+  figure svg{min-width:0}
+  figure,pre,.card,.callout,tr{break-inside:avoid}
+  a{color:inherit}
+}
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" class="svg-ah"/>
+    </marker>
+  </defs>
+</svg>
+
+<main class="paper">
+
+<header>
+  <p class="eyebrow">Design document · short version · Draft v0.2 · 2026-11-02</p>
+  <h1>Exchange Adapter ↔ AI Workflow Engine</h1>
+  <div class="callout" role="note">
+    <p><strong>Proposal only.</strong> Just the <a href="https://github.com/rutzsco/ExchangeIntegration">Milestone 1 connectivity probe</a> is built, and live access to the customer's Exchange is <strong>not yet verified</strong>.</p>
+  </div>
+</header>
+
+<section id="overview">
+  <h2><span class="num">1</span>Overview</h2>
+  <p>Invoices arrive as emails in an on-premises Exchange mailbox. A small Windows service, the <strong>Exchange Adapter</strong>, copies each email's attachments to <strong>Azure Blob Storage</strong> and tells the cloud <strong>AI Workflow Engine</strong> about it through <strong>Azure Service Bus</strong>. The Engine checks the invoice and sends back instructions that the adapter carries out in Exchange: <strong>email the sender</strong> if the invoice is invalid, and <strong>move the message to the Processed folder</strong>.</p>
+  <div class="cards">
+    <div class="card"><b>Files in storage</b><span>Messages carry only IDs and a link, so they stay small (256 KB limit on Standard).</span></div>
+    <div class="card"><b>The adapter calls out</b><span>Nothing in Azure connects into the customer network: no inbound firewall rules.</span></div>
+    <div class="card"><b>Safe to repeat</b><span>Each email has a stable ID, so a retry is recognized, not duplicated.</span></div>
+    <div class="card"><b>No stored secrets</b><span>Windows identity for Exchange, Entra ID for Azure. No passwords or keys.</span></div>
+  </div>
+</section>
+
+<section id="architecture">
+  <h2><span class="num">2</span>Architecture</h2>
+  <figure id="fig1" class="scroll">
+<svg viewBox="0 0 760 396" role="img" aria-labelledby="f1-title f1-desc">
+  <title id="f1-title">Architecture overview</title>
+  <desc id="f1-desc">Exchange Server and the Exchange Adapter sit in the customer network. Blob Storage, Service Bus with three queues, and the AI Workflow Engine sit in Azure. The adapter reads email from Exchange, saves files to Blob Storage and announces each email on the invoice-received queue. The engine reads the files, decides, and sends commands on the exchange-commands queue, which the adapter pulls and carries out in Exchange. The adapter reports results on the exchange-command-results queue.</desc>
+
+  <rect class="svg-zone" x="8" y="8" width="228" height="380" rx="14"/>
+  <text class="svg-zl" x="24" y="32">CUSTOMER NETWORK</text>
+  <rect class="svg-zone az" x="268" y="8" width="484" height="380" rx="14"/>
+  <text class="svg-zl" x="284" y="32">AZURE</text>
+
+  <rect class="svg-box" x="24" y="46" width="196" height="86" rx="10"/>
+  <rect class="svg-box hl" x="24" y="174" width="196" height="196" rx="10"/>
+  <rect class="svg-box hl" x="284" y="46" width="208" height="86" rx="10"/>
+  <rect class="svg-box hl" x="284" y="174" width="208" height="196" rx="10"/>
+  <rect class="svg-box hl" x="556" y="46" width="180" height="324" rx="10"/>
+
+  <path class="svg-a" d="M82,132 L82,172" marker-end="url(#ah)"/>
+  <path class="svg-a" d="M162,174 L162,134" marker-end="url(#ah)"/>
+  <path class="svg-a" d="M220,186 L252,186 L252,89 L282,89" marker-end="url(#ah)"/>
+  <path class="svg-a" d="M492,89 L554,89" marker-end="url(#ah)"/>
+  <path class="svg-a" d="M220,236 L554,236" marker-end="url(#ah)"/>
+  <path class="svg-a d" d="M556,284 L222,284" marker-end="url(#ah)"/>
+  <path class="svg-a" d="M220,332 L554,332" marker-end="url(#ah)"/>
+
+  <text class="svg-t" x="40" y="68">Exchange Server</text>
+  <rect class="svg-chip" x="40" y="82" width="72" height="34" rx="8"/>
+  <text class="svg-m" x="76" y="104" text-anchor="middle">Inbox</text>
+  <rect class="svg-chip" x="120" y="82" width="84" height="34" rx="8"/>
+  <text class="svg-m" x="162" y="104" text-anchor="middle">Processed</text>
+
+  <text class="svg-t" x="40" y="196">Exchange Adapter</text>
+  <text class="svg-s" x="40" y="212">Windows service</text>
+  <rect class="svg-chip" x="38" y="222" width="168" height="42" rx="8"/>
+  <text class="svg-mb" x="52" y="240">Ingestion</text>
+  <text class="svg-s" x="52" y="257">email → Azure</text>
+  <rect class="svg-chip" x="38" y="276" width="168" height="70" rx="8"/>
+  <text class="svg-mb" x="52" y="294">Commands</text>
+  <text class="svg-s" x="52" y="311">Azure → Exchange</text>
+  <text class="svg-s" x="52" y="328">pulls from Service Bus</text>
+
+  <text class="svg-t" x="300" y="68">Blob Storage</text>
+  <text class="svg-s" x="300" y="88">invoice-intake</text>
+  <text class="svg-s" x="300" y="106">files + manifest.json</text>
+
+  <text class="svg-t" x="300" y="196">Service Bus</text>
+  <rect class="svg-chip" x="298" y="219" width="180" height="34" rx="8"/>
+  <text class="svg-m" x="310" y="241">invoice-received</text>
+  <rect class="svg-chip" x="298" y="267" width="180" height="34" rx="8"/>
+  <text class="svg-m" x="310" y="289">exchange-commands</text>
+  <rect class="svg-chip" x="298" y="315" width="180" height="34" rx="8"/>
+  <text class="svg-m" x="310" y="337">exchange-command-results</text>
+
+  <text class="svg-t" x="572" y="70">AI Workflow Engine</text>
+  <text class="svg-s" x="572" y="90">Reads the files,</text>
+  <text class="svg-s" x="572" y="107">validates, decides</text>
+  <rect class="svg-chip" x="570" y="122" width="152" height="214" rx="8"/>
+  <text class="svg-mb" x="582" y="146">Valid invoice</text>
+  <text class="svg-s" x="582" y="163">move to Processed</text>
+  <text class="svg-mb" x="582" y="204">Invalid invoice</text>
+  <text class="svg-s" x="582" y="221">email the sender,</text>
+  <text class="svg-s" x="582" y="238">then move</text>
+  <text class="svg-mb" x="582" y="278">Cannot decide</text>
+  <text class="svg-s" x="582" y="295">alert; the email</text>
+  <text class="svg-s" x="582" y="312">stays in the Inbox</text>
+
+  <text class="svg-s" x="122" y="158" text-anchor="middle">EWS</text>
+  <circle class="svg-b" cx="82" cy="153" r="11"/><text class="svg-bt" x="82" y="157">1</text>
+  <circle class="svg-b" cx="162" cy="153" r="11"/><text class="svg-bt" x="162" y="157">6</text>
+  <circle class="svg-b" cx="252" cy="137" r="11"/><text class="svg-bt" x="252" y="141">2</text>
+  <circle class="svg-b" cx="252" cy="236" r="11"/><text class="svg-bt" x="252" y="240">3</text>
+  <circle class="svg-b" cx="524" cy="89" r="11"/><text class="svg-bt" x="524" y="93">4</text>
+  <circle class="svg-b" cx="524" cy="284" r="11"/><text class="svg-bt" x="524" y="288">5</text>
+  <circle class="svg-b" cx="252" cy="332" r="11"/><text class="svg-bt" x="252" y="336">7</text>
+</svg>
+    <figcaption>Figure 1. The numbers match the steps below. Each queue sits between a sender and a receiver. The dashed lane is pulled by the adapter, so nothing in Azure connects into the customer network.</figcaption>
+  </figure>
+</section>
+
+<section id="inbound">
+  <h2><span class="num">3</span>Email in: Exchange → Blob Storage → Service Bus</h2>
+  <ol class="steps">
+    <li data-n="1"><strong>Read.</strong> On a schedule (for example once a minute) the adapter reads new email from the Inbox through Exchange Web Services (EWS), as the Windows service account. The email stays in the Inbox.</li>
+    <li data-n="2"><strong>Save.</strong> Each attachment goes to Blob Storage in a folder named after the email's <code>messageKey</code>. A small <code>manifest.json</code> (sender, subject, file list) is written last, so its presence means the capture is complete.</li>
+    <li data-n="3"><strong>Announce.</strong> One <code>invoice.received</code> message, which only points at the manifest, goes to Service Bus. Only then does the adapter save its place, so after a crash the email is simply picked up again.</li>
+    <li data-n="4"><strong>Process.</strong> The Engine receives the message, reads the manifest and files from Blob Storage, and validates the invoice.</li>
+  </ol>
+</section>
+
+<section id="outbound">
+  <h2><span class="num">4</span>Decision back: Engine → Service Bus → Exchange</h2>
+  <ol class="steps">
+    <li data-n="5"><strong>Command.</strong> A valid invoice gets a <code>move</code>. An invalid one gets a <code>reply</code> first, and the <code>move</code> only once the reply's result says it worked. If the Engine cannot decide, it sends nothing and an alert is raised.</li>
+    <li data-n="6"><strong>Act.</strong> The adapter pulls the command and checks it against its own rules (known mailbox, known folder, reply only to the original sender), then carries it out in Exchange. Work already done is skipped.</li>
+    <li data-n="7"><strong>Report.</strong> A <code>succeeded</code> or <code>failed</code> result goes back to the Engine. On a failure the email stays in the Inbox and an alert is raised, so nothing is moved or sent silently.</li>
+  </ol>
+</section>
+
+<section id="messages">
+  <h2><span class="num">5</span>Messages</h2>
+  <p>Three small JSON messages cross Service Bus. They carry IDs and links, never email content.</p>
+  <div class="table-wrap scroll">
+    <table class="msgs">
+      <thead><tr><th>Message</th><th>Direction</th><th>Key fields</th></tr></thead>
+      <tbody>
+        <tr><td><code>invoice.received</code></td><td>Adapter → Engine</td><td><code>messageKey</code>, <code>mailbox</code>, <code>receivedUtc</code>, link to <code>manifest.json</code></td></tr>
+        <tr><td><code>exchange.command.reply</code><br><code>exchange.command.move</code></td><td>Engine → Adapter</td><td><code>commandId</code>, <code>messageKey</code>, <code>internetMessageId</code>, <code>mailbox</code>, reply text or target folder</td></tr>
+        <tr><td><code>exchange.command.result</code></td><td>Adapter → Engine</td><td><code>commandId</code>, <code>status</code> (succeeded or failed), failure reason</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="small"><code>messageKey</code> is a hash of the mailbox and the email's Message-ID. It names the blob folder, is the Service Bus message ID and starts every <code>commandId</code> (for example <code>&lt;messageKey&gt;.reply</code>), so repeats are recognized.</p>
+  <div class="pair">
+    <div>
+      <p><code>invoice.received</code> (shortened)</p>
+      <pre class="scroll"><code>{
+  "type": "invoice.received",
+  "messageKey": "3f9a1c0e5b7d4a62…",
+  "mailbox": "ap-invoices@contoso.com",
+  "receivedUtc": "2026-11-02T14:03:11Z",
+  "manifest": "https://…/3f9a…/manifest.json"
+}</code></pre>
+    </div>
+    <div>
+      <p><code>exchange.command.reply</code> (shortened)</p>
+      <pre class="scroll"><code>{
+  "type": "exchange.command.reply",
+  "commandId": "3f9a1c0e….reply",
+  "messageKey": "3f9a1c0e5b7d4a62…",
+  "internetMessageId": "&lt;CAB123@vendor.example&gt;",
+  "mailbox": "ap-invoices@contoso.com",
+  "reply": { "bodyText": "Please add the PO number." }
+}</code></pre>
+    </div>
+  </div>
+</section>
+
+<section id="further">
+  <h2><span class="num">6</span>Further considerations</h2>
+  <p>Topics for the next iteration. Where this version assumes an answer, it says so.</p>
+  <div class="table-wrap scroll">
+    <table class="further">
+      <thead><tr><th>#</th><th>Topic</th><th>Consideration</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>Prove Exchange access</td><td>Not yet run against the customer's Exchange. The probe must succeed as the real service account, with Kerberos or NTLM recorded, before anything here is built.</td></tr>
+        <tr><td>2</td><td>Mailbox permissions</td><td>The service account must read the Inbox, move messages and send as the mailbox: Full Access plus Send As (simplest), folder-level rights (narrower) or scoped impersonation.</td></tr>
+        <tr><td>3</td><td>Folders</td><td>Assumed: one <code>Processed</code> folder for everything handled. Do invalid invoices need their own <code>Invalid</code> folder, or a <code>Review</code> folder for items a person must check?</td></tr>
+        <tr><td>4</td><td>Email to the sender</td><td>Assumed: a reply to the original sender only, from the invoice mailbox. Fixed templates or AI-written text, and who approves them? Never reply to automatic mail, and cap replies to avoid loops.</td></tr>
+        <tr><td>5</td><td>Untrusted content</td><td>Email text and attachments are untrusted input to an AI system: they must never choose recipients, folders or commands. Scan for malware; the verdict arrives after upload.</td></tr>
+        <tr><td>6</td><td>Azure sign-in, network</td><td>Managed identity through Azure Arc, or a certificate; never keys. Can the host reach Azure on TCP 5671 or 443 (WebSockets) without a proxy? Private endpoints need Service Bus Premium.</td></tr>
+        <tr><td>7</td><td>Failures, monitoring</td><td>Retries, dead-letter queues, stuck emails, one adapter or a standby. Crash-test every step and prove a reply is never sent twice. Alert on heartbeat, queue depth and oldest Inbox email.</td></tr>
+        <tr><td>8</td><td>Volumes, retention</td><td>Emails per day, largest attachment and required speed set polling, size limits and throttling headroom. How long are invoices kept, and is a legal hold needed?</td></tr>
+        <tr><td>9</td><td>Running as a service</td><td>Windows Service hosting, restart and deployment, the Active Directory service account (today a console app only), separate dev, test and production resources, a test mailbox.</td></tr>
+        <tr><td>10</td><td>Exchange Online later</td><td>EWS is being retired in Exchange Online (from 1 Oct 2026); Microsoft says on-premises Exchange Server is not affected. If the mailbox ever moves, Exchange access switches to Microsoft Graph.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<p class="small sources">Sources: <a href="https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-quotas">Service Bus quotas</a> · <a href="https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-premium-messaging">Service Bus Premium</a> · <a href="https://learn.microsoft.com/en-us/azure/service-bus-messaging/service-bus-faq">Service Bus FAQ (ports)</a> · <a href="https://learn.microsoft.com/en-us/azure/azure-arc/servers/managed-identity-authentication">Managed identity on Azure Arc</a> · <a href="https://learn.microsoft.com/en-us/azure/defender-for-cloud/understand-malware-scan-results">Defender for Storage scan results</a> · <a href="https://mc.merill.net/message/MC1227454">Message Center MC1227454 (EWS retirement)</a>.</p>
+
+</main>
+
+<script>
+(function () {
+  var regions = document.querySelectorAll('.scroll');
+  function update() {
+    regions.forEach(function (el) {
+      if (el.scrollWidth > el.clientWidth + 1) { el.setAttribute('tabindex', '0'); }
+      else { el.removeAttribute('tabindex'); }
+    });
+  }
+  update();
+  window.addEventListener('resize', update);
+})();
+</script>
+</body>
+</html>
