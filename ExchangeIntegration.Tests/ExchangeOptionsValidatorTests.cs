@@ -132,6 +132,41 @@ public class ExchangeOptionsValidatorTests
         Assert.Empty(ExchangeOptionsValidator.GetFailures(options));
     }
 
+    [Theory]
+    [InlineData(4, 20)]
+    [InlineData(3601, 20)]
+    [InlineData(60, 0)]
+    [InlineData(60, 501)]
+    public void Service_mode_poll_settings_outside_their_ranges_are_rejected(int pollIntervalSeconds, int maxMessagesPerPoll)
+    {
+        var options = ValidOptions();
+        options.PollIntervalSeconds = pollIntervalSeconds;
+        options.MaxMessagesPerPoll = maxMessagesPerPoll;
+
+        Assert.Single(ExchangeOptionsValidator.GetServiceModeFailures(options));
+        Assert.Empty(ExchangeOptionsValidator.GetFailures(options));
+        Assert.False(new ServiceModeExchangeOptionsValidator().Validate(null, options).Succeeded);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("Inbox/Processed")]
+    [InlineData("Archive\\2026")]
+    public void Move_folders_must_be_top_level_display_names(string folder)
+    {
+        var options = ValidOptions();
+        options.MoveFolders = ["Processed", folder];
+
+        Assert.Contains(ExchangeOptionsValidator.GetServiceModeFailures(options), failure => failure.Contains("Exchange:MoveFolders"));
+    }
+
+    [Fact]
+    public void Move_folders_default_to_processed_only()
+    {
+        Assert.Equal(["Processed"], new ExchangeOptions().GetMoveFolders());
+        Assert.Equal(["Done", "Rejected"], new ExchangeOptions { MoveFolders = ["Done", "Rejected"] }.GetMoveFolders());
+    }
+
     [Fact]
     public void Every_problem_is_reported_in_one_pass()
     {

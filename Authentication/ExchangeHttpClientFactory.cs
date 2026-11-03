@@ -12,8 +12,14 @@ public static class ExchangeHttpClientFactory
     /// <summary>Sent on every request so administrators can recognize the probe in IIS logs and EWS access policies.</summary>
     public const string UserAgent = "ExchangeIntegration-EwsProbe/1.0";
 
+    /// <summary>Sent by service mode (--run), so its traffic is distinguishable from the probe's.</summary>
+    public const string AdapterUserAgent = "ExchangeIntegration-Adapter/1.0";
+
     /// <summary>EWS answers to a read-only GetFolder are tiny; refuse to buffer anything unreasonably large.</summary>
     public const long MaxResponseBytes = 1024 * 1024;
+
+    /// <summary>Service mode downloads attachments as base64 inside SOAP, so it allows far larger responses.</summary>
+    public const long AdapterMaxResponseBytes = 128L * 1024 * 1024;
 
     public static HttpClientHandler CreateHandler() => new()
     {
@@ -23,8 +29,15 @@ public static class ExchangeHttpClientFactory
 
     public static HttpClient Create(ExchangeOptions options) => Create(options, CreateHandler());
 
+    /// <summary>The service-mode client: same Windows authentication and redirect policy, larger responses.</summary>
+    public static HttpClient CreateForAdapter(ExchangeOptions options) =>
+        Create(options, CreateHandler(), AdapterUserAgent, AdapterMaxResponseBytes);
+
     /// <summary>Applies the client-level settings to a caller-supplied handler (a mocked transport in tests).</summary>
-    public static HttpClient Create(ExchangeOptions options, HttpMessageHandler handler)
+    public static HttpClient Create(ExchangeOptions options, HttpMessageHandler handler) =>
+        Create(options, handler, UserAgent, MaxResponseBytes);
+
+    private static HttpClient Create(ExchangeOptions options, HttpMessageHandler handler, string userAgent, long maxResponseBytes)
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(handler);
@@ -32,9 +45,9 @@ public static class ExchangeHttpClientFactory
         var client = new HttpClient(handler)
         {
             Timeout = TimeSpan.FromSeconds(options.TimeoutSeconds),
-            MaxResponseContentBufferSize = MaxResponseBytes,
+            MaxResponseContentBufferSize = maxResponseBytes,
         };
-        client.DefaultRequestHeaders.UserAgent.ParseAdd(UserAgent);
+        client.DefaultRequestHeaders.UserAgent.ParseAdd(userAgent);
         return client;
     }
 }

@@ -31,6 +31,30 @@ public sealed class ExchangeOptionsValidator : IValidateOptions<ExchangeOptions>
         return failures;
     }
 
+    /// <summary>The settings only service mode (--run) uses, so they never stop the read-only probe.</summary>
+    public static IReadOnlyList<string> GetServiceModeFailures(ExchangeOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+
+        var failures = new List<string>();
+        if (options.PollIntervalSeconds < 5 || options.PollIntervalSeconds > 3600)
+        {
+            failures.Add("Exchange:PollIntervalSeconds must be between 5 and 3600 seconds.");
+        }
+
+        if (options.MaxMessagesPerPoll < 1 || options.MaxMessagesPerPoll > 500)
+        {
+            failures.Add("Exchange:MaxMessagesPerPoll must be between 1 and 500.");
+        }
+
+        if ((options.MoveFolders ?? []).Any(folder => string.IsNullOrWhiteSpace(folder) || folder.Length > 255 || folder.Contains('/') || folder.Contains('\\')))
+        {
+            failures.Add("Exchange:MoveFolders entries must be non-empty folder display names (top-level folders only, no paths).");
+        }
+
+        return failures;
+    }
+
     private static void ValidateEwsUrl(string? ewsUrl, List<string> failures)
     {
         if (string.IsNullOrWhiteSpace(ewsUrl))
@@ -85,5 +109,15 @@ public sealed class ExchangeOptionsValidator : IValidateOptions<ExchangeOptions>
         {
             failures.Add($"Exchange:AccessMode '{accessMode}' is not supported in this milestone. The supported value is Delegated.");
         }
+    }
+}
+
+/// <summary>Validates the service-mode-only <see cref="ExchangeOptions"/> settings; registered only by AddExchangeAdapter.</summary>
+public sealed class ServiceModeExchangeOptionsValidator : IValidateOptions<ExchangeOptions>
+{
+    public ValidateOptionsResult Validate(string? name, ExchangeOptions options)
+    {
+        var failures = ExchangeOptionsValidator.GetServiceModeFailures(options);
+        return failures.Count == 0 ? ValidateOptionsResult.Success : ValidateOptionsResult.Fail(failures);
     }
 }

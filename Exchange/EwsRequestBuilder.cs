@@ -33,6 +33,23 @@ public static class EwsRequestBuilder
             throw new NotSupportedException($"Access mode '{accessMode}' is not supported in this milestone; only Delegated is implemented.");
         }
 
+        return BuildRequest(
+            new XElement(
+                Messages + "GetFolder",
+                new XElement(
+                    Messages + "FolderShape",
+                    new XElement(Types + "BaseShape", "IdOnly"),
+                    new XElement(
+                        Types + "AdditionalProperties",
+                        new XElement(Types + "FieldURI", new XAttribute("FieldURI", "folder:DisplayName")))),
+                new XElement(Messages + "FolderIds", DistinguishedFolder("inbox", mailbox))));
+    }
+
+    /// <summary>Wraps one EWS operation element in the SOAP envelope and header shared by every request.</summary>
+    public static string BuildRequest(XElement operation)
+    {
+        ArgumentNullException.ThrowIfNull(operation);
+
         var envelope = new XElement(
             Soap + "Envelope",
             new XAttribute(XNamespace.Xmlns + "soap", Soap),
@@ -41,25 +58,15 @@ public static class EwsRequestBuilder
             new XElement(
                 Soap + "Header",
                 new XElement(Types + "RequestServerVersion", new XAttribute("Version", RequestedServerVersion))),
-            new XElement(
-                Soap + "Body",
-                new XElement(
-                    Messages + "GetFolder",
-                    new XElement(
-                        Messages + "FolderShape",
-                        new XElement(Types + "BaseShape", "IdOnly"),
-                        new XElement(
-                            Types + "AdditionalProperties",
-                            new XElement(Types + "FieldURI", new XAttribute("FieldURI", "folder:DisplayName")))),
-                    new XElement(
-                        Messages + "FolderIds",
-                        new XElement(
-                            Types + "DistinguishedFolderId",
-                            new XAttribute("Id", "inbox"),
-                            new XElement(
-                                Types + "Mailbox",
-                                new XElement(Types + "EmailAddress", mailbox)))))));
+            new XElement(Soap + "Body", operation));
 
         return new XDeclaration("1.0", "utf-8", null) + Environment.NewLine + envelope.ToString(SaveOptions.DisableFormatting);
     }
+
+    /// <summary>A well-known folder (inbox, sentitems, msgfolderroot) of the given mailbox.</summary>
+    public static XElement DistinguishedFolder(string folderId, string mailbox) =>
+        new(
+            Types + "DistinguishedFolderId",
+            new XAttribute("Id", folderId),
+            new XElement(Types + "Mailbox", new XElement(Types + "EmailAddress", mailbox)));
 }

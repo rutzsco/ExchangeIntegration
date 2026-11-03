@@ -219,7 +219,7 @@ public sealed class EwsClient : IEwsClient
             serverVersion: parsed.ServerVersion);
     }
 
-    private static FailureCategory CategoryFor(string? ewsResponseCode) => ewsResponseCode switch
+    internal static FailureCategory CategoryFor(string? ewsResponseCode) => ewsResponseCode switch
     {
         "ErrorAccessDenied" or "ErrorImpersonateUserDenied" or "ErrorImpersonationDenied" => FailureCategory.MailboxAuthorization,
         "ErrorNonExistentMailbox" or "ErrorInvalidSmtpAddress" or "ErrorMissingEmailAddress" or "ErrorNonPrimarySmtpAddress" => FailureCategory.MailboxResolution,
@@ -260,7 +260,7 @@ public sealed class EwsClient : IEwsClient
         return Failure(FailureCategory.Connectivity, $"The Exchange endpoint was not reached: {reason} ({detail}).");
     }
 
-    private static bool IsTlsFailure(HttpRequestException exception)
+    internal static bool IsTlsFailure(HttpRequestException exception)
     {
         if (exception.HttpRequestError == HttpRequestError.SecureConnectionError)
         {
@@ -278,7 +278,7 @@ public sealed class EwsClient : IEwsClient
         return false;
     }
 
-    private static bool IsSocketTimeout(HttpRequestException exception)
+    internal static bool IsSocketTimeout(HttpRequestException exception)
     {
         for (Exception? current = exception; current is not null; current = current.InnerException)
         {
@@ -291,7 +291,7 @@ public sealed class EwsClient : IEwsClient
         return false;
     }
 
-    private static string Describe(Exception exception)
+    internal static string Describe(Exception exception)
     {
         var innermost = exception;
         while (innermost.InnerException is not null)

@@ -120,7 +120,7 @@ public static class EwsResponseParser
         };
     }
 
-    private static XElement LoadEnvelope(string soapXml)
+    internal static XElement LoadEnvelope(string soapXml)
     {
         XDocument document;
         try
@@ -165,7 +165,7 @@ public static class EwsResponseParser
             : null;
     }
 
-    private static EwsSoapFault ReadFault(XElement fault)
+    internal static EwsSoapFault ReadFault(XElement fault)
     {
         var detail = fault.Element("detail");
         var detailCode = detail?.Elements().FirstOrDefault(element => element.Name.LocalName == "ResponseCode")?.Value.Trim();

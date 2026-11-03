@@ -49,14 +49,16 @@ code{font:.9em var(--mono);padding:1px 5px;border:1px solid var(--line);border-r
 .card{padding:9px 12px;border:1px solid var(--line);border-radius:10px;background:var(--soft)}
 .card b{display:block;margin-bottom:2px;font-size:14.5px;line-height:1.3}
 .card span{font-size:13.5px;line-height:1.4;color:var(--muted)}
+.cards+p{margin-top:12px}
 
 figure{margin:10px 0 0;overflow-x:auto}
 figure svg{display:block;width:100%;min-width:640px;height:auto;border:1px solid var(--line);border-radius:12px;background:var(--surface)}
 figcaption{margin-top:6px;font-size:13px;color:var(--muted)}
 
 ol.steps{margin:6px 0 0;padding:0;list-style:none}
-ol.steps li{position:relative;margin:0 0 8px;padding-left:34px}
-ol.steps li::before{content:attr(data-n);position:absolute;left:0;top:1px;width:22px;height:22px;border-radius:50%;background:var(--brand);color:var(--on-brand);font:700 12.5px/22px var(--sans);text-align:center}
+ol.steps>li{position:relative;margin:0 0 8px;padding-left:34px}
+ol.steps>li::before{content:attr(data-n);position:absolute;left:0;top:1px;width:22px;height:22px;border-radius:50%;background:var(--brand);color:var(--on-brand);font:700 12.5px/22px var(--sans);text-align:center}
+ol.steps ul{margin:4px 0 0}
 
 .table-wrap{overflow-x:auto;margin:8px 0 10px}
 table{border-collapse:collapse;width:100%;font-size:14px}
@@ -143,10 +145,10 @@ pre code{padding:0;border:0;background:none;color:inherit;font:inherit;overflow-
 <main class="paper">
 
 <header>
-  <p class="eyebrow">Design document · short version · Draft v0.2 · 2026-11-02</p>
+  <p class="eyebrow">Design document · short version · Draft v0.3 · 2026-11-03</p>
   <h1>Exchange Adapter ↔ AI Workflow Engine</h1>
   <div class="callout" role="note">
-    <p><strong>Proposal only.</strong> Just the <a href="https://github.com/rutzsco/ExchangeIntegration">Milestone 1 connectivity probe</a> is built, and live access to the customer's Exchange is <strong>not yet verified</strong>.</p>
+    <p><strong>Built, not yet verified live.</strong> This design is built in the <a href="https://github.com/rutzsco/ExchangeIntegration">adapter</a> as <strong>service mode</strong> (<code>--run</code>), next to the original connectivity <strong>test mode</strong> (<code>--probe</code>). Both are covered by automated tests only. Neither has run against the customer's Exchange or Azure yet (see consideration 1).</p>
   </div>
 </header>
 
@@ -159,6 +161,12 @@ pre code{padding:0;border:0;background:none;color:inherit;font:inherit;overflow-
     <div class="card"><b>Safe to repeat</b><span>Each email has a stable ID, so a retry is recognized, not duplicated.</span></div>
     <div class="card"><b>No stored secrets</b><span>Windows identity for Exchange, Entra ID for Azure. No passwords or keys.</span></div>
   </div>
+  <p>One executable has two modes:</p>
+  <ul>
+    <li><code>--probe</code> (<strong>test mode</strong>) runs one read-only Inbox check and exits. It proves Exchange access and needs no Azure.</li>
+    <li><code>--run</code> (<strong>service mode</strong>) runs the two loops below until stopped, normally as a Windows service.</li>
+  </ul>
+  <p>Service mode keeps no database or local state: Blob Storage holds its checkpoints.</p>
 </section>
 
 <section id="architecture">
@@ -244,10 +252,10 @@ pre code{padding:0;border:0;background:none;color:inherit;font:inherit;overflow-
 <section id="inbound">
   <h2><span class="num">3</span>Email in: Exchange → Blob Storage → Service Bus</h2>
   <ol class="steps">
-    <li data-n="1"><strong>Read.</strong> On a schedule (for example once a minute) the adapter reads new email from the Inbox through Exchange Web Services (EWS), as the Windows service account. The email stays in the Inbox.</li>
-    <li data-n="2"><strong>Save.</strong> Each attachment goes to Blob Storage in a folder named after the email's <code>messageKey</code>. A small <code>manifest.json</code> (sender, subject, file list) is written last, so its presence means the capture is complete.</li>
-    <li data-n="3"><strong>Announce.</strong> One <code>invoice.received</code> message, which only points at the manifest, goes to Service Bus. Only then does the adapter save its place, so after a crash the email is simply picked up again.</li>
-    <li data-n="4"><strong>Process.</strong> The Engine receives the message, reads the manifest and files from Blob Storage, and validates the invoice.</li>
+    <li data-n="1"><strong>Read.</strong> Every <code>PollIntervalSeconds</code> (60 s by default) the adapter lists the Inbox, oldest first, through Exchange Web Services (EWS), as the Windows service account. It captures at most <code>MaxMessagesPerPoll</code> (20) new emails per pass. The email stays in the Inbox, unchanged. Emails without a Message-ID are left alone and reported in the log.</li>
+    <li data-n="2"><strong>Save.</strong> Each file attachment goes to Blob Storage under <code>&lt;messageKey&gt;/attachments/</code>. Attached emails are counted but not stored. A small <code>manifest.json</code> (sender, subject, file list) is written last, so its presence means the capture is complete.</li>
+    <li data-n="3"><strong>Announce.</strong> One <code>invoice.received</code> message, which only points at the manifest, goes to Service Bus. Only then does the adapter mark the manifest as announced (blob metadata), and that mark is its only checkpoint. After a crash the email is captured and announced again: Service Bus duplicate detection drops the repeat, and the Engine treats a repeat as harmless.</li>
+    <li data-n="4"><strong>Process.</strong> The Engine receives the message, reads the manifest and files from Blob Storage with its own identity, and validates the invoice.</li>
   </ol>
 </section>
 
@@ -255,8 +263,14 @@ pre code{padding:0;border:0;background:none;color:inherit;font:inherit;overflow-
   <h2><span class="num">4</span>Decision back: Engine → Service Bus → Exchange</h2>
   <ol class="steps">
     <li data-n="5"><strong>Command.</strong> A valid invoice gets a <code>move</code>. An invalid one gets a <code>reply</code> first, and the <code>move</code> only once the reply's result says it worked. If the Engine cannot decide, it sends nothing and an alert is raised.</li>
-    <li data-n="6"><strong>Act.</strong> The adapter pulls the command and checks it against its own rules (known mailbox, known folder, reply only to the original sender), then carries it out in Exchange. Work already done is skipped.</li>
-    <li data-n="7"><strong>Report.</strong> A <code>succeeded</code> or <code>failed</code> result goes back to the Engine. On a failure the email stays in the Inbox and an alert is raised, so nothing is moved or sent silently.</li>
+    <li data-n="6"><strong>Act.</strong> The adapter pulls one command at a time and checks it against its own rules: this mailbox, a folder from its <code>MoveFolders</code> list, and a <code>commandId</code> and <code>messageKey</code> that belong to the email. It finds the email in the Inbox by Message-ID and carries out the command.
+      <ul>
+        <li>A <strong>reply</strong> is a new plain-text email, sent as the mailbox to the original From address only (never <code>Reply-To</code>) and threaded with <code>In-Reply-To</code>.</li>
+        <li>The adapter refuses to reply to mail from the mailbox itself or automatic mail (<code>Auto-Submitted</code>).</li>
+        <li>A command record in Blob Storage makes repeats safe: work already done is skipped, and a reply is sent at most once.</li>
+      </ul>
+    </li>
+    <li data-n="7"><strong>Report.</strong> A <code>succeeded</code> or <code>failed</code> result goes back to the Engine. A failure has a <code>reason</code>, and <code>retryable</code> says whether sending the same command later may work. On a failure the email stays in the Inbox and an alert is raised, so nothing is moved or sent silently. A message that is not a valid command (bad JSON, no usable <code>commandId</code>) goes to the dead-letter queue instead.</li>
   </ol>
 </section>
 
@@ -267,13 +281,13 @@ pre code{padding:0;border:0;background:none;color:inherit;font:inherit;overflow-
     <table class="msgs">
       <thead><tr><th>Message</th><th>Direction</th><th>Key fields</th></tr></thead>
       <tbody>
-        <tr><td><code>invoice.received</code></td><td>Adapter → Engine</td><td><code>messageKey</code>, <code>mailbox</code>, <code>receivedUtc</code>, link to <code>manifest.json</code></td></tr>
-        <tr><td><code>exchange.command.reply</code><br><code>exchange.command.move</code></td><td>Engine → Adapter</td><td><code>commandId</code>, <code>messageKey</code>, <code>internetMessageId</code>, <code>mailbox</code>, reply text or target folder</td></tr>
-        <tr><td><code>exchange.command.result</code></td><td>Adapter → Engine</td><td><code>commandId</code>, <code>status</code> (succeeded or failed), failure reason</td></tr>
+        <tr><td><code>invoice.received</code></td><td>Adapter → Engine</td><td><code>messageKey</code>, <code>mailbox</code>, <code>internetMessageId</code>, <code>receivedUtc</code>, link to <code>manifest.json</code></td></tr>
+        <tr><td><code>exchange.command.reply</code><br><code>exchange.command.move</code></td><td>Engine → Adapter</td><td><code>commandId</code>, <code>messageKey</code>, <code>internetMessageId</code>, <code>mailbox</code>, <code>reply.bodyText</code> or <code>move.folder</code></td></tr>
+        <tr><td><code>exchange.command.result</code></td><td>Adapter → Engine</td><td><code>commandId</code>, <code>messageKey</code>, <code>status</code> (succeeded or failed), <code>reason</code>, <code>retryable</code></td></tr>
       </tbody>
     </table>
   </div>
-  <p class="small"><code>messageKey</code> is a hash of the mailbox and the email's Message-ID. It names the blob folder, is the Service Bus message ID and starts every <code>commandId</code> (for example <code>&lt;messageKey&gt;.reply</code>), so repeats are recognized.</p>
+  <p class="small"><code>messageKey</code> is 32 hex characters of a SHA-256 hash of the mailbox and the email's Message-ID. It names the blob folder, is the Service Bus message ID of <code>invoice.received</code> and starts every <code>commandId</code> (for example <code>&lt;messageKey&gt;.reply</code>), so repeats are recognized. Reusing a <code>commandId</code> returns the first result, so a deliberate second reply needs a new suffix. Results carry <code>commandId</code> as their Service Bus correlation ID.</p>
   <div class="pair">
     <div>
       <p><code>invoice.received</code> (shortened)</p>
@@ -281,7 +295,8 @@ pre code{padding:0;border:0;background:none;color:inherit;font:inherit;overflow-
   "type": "invoice.received",
   "messageKey": "3f9a1c0e5b7d4a62…",
   "mailbox": "ap-invoices@contoso.com",
-  "receivedUtc": "2026-11-02T14:03:11Z",
+  "internetMessageId": "&lt;CAB123@vendor.example&gt;",
+  "receivedUtc": "2026-11-02T14:03:11+00:00",
   "manifest": "https://…/3f9a…/manifest.json"
 }</code></pre>
     </div>
@@ -297,24 +312,49 @@ pre code{padding:0;border:0;background:none;color:inherit;font:inherit;overflow-
 }</code></pre>
     </div>
   </div>
+  <div class="pair">
+    <div>
+      <p><code>exchange.command.move</code> (shortened)</p>
+      <pre class="scroll"><code>{
+  "type": "exchange.command.move",
+  "commandId": "3f9a1c0e….move",
+  "messageKey": "3f9a1c0e5b7d4a62…",
+  "internetMessageId": "&lt;CAB123@vendor.example&gt;",
+  "mailbox": "ap-invoices@contoso.com",
+  "move": { "folder": "Processed" }
+}</code></pre>
+    </div>
+    <div>
+      <p><code>exchange.command.result</code> (shortened)</p>
+      <pre class="scroll"><code>{
+  "type": "exchange.command.result",
+  "commandId": "3f9a1c0e….move",
+  "messageKey": "3f9a1c0e5b7d4a62…",
+  "status": "failed",
+  "reason": "The email is not in the Inbox …",
+  "retryable": false,
+  "completedUtc": "2026-11-02T14:05:02+00:00"
+}</code></pre>
+    </div>
+  </div>
 </section>
 
 <section id="further">
   <h2><span class="num">6</span>Further considerations</h2>
-  <p>Topics for the next iteration. Where this version assumes an answer, it says so.</p>
+  <p>Topics for the next iteration. "As built" marks what this version decided; the rest is still open.</p>
   <div class="table-wrap scroll">
     <table class="further">
       <thead><tr><th>#</th><th>Topic</th><th>Consideration</th></tr></thead>
       <tbody>
-        <tr><td>1</td><td>Prove Exchange access</td><td>Not yet run against the customer's Exchange. The probe must succeed as the real service account, with Kerberos or NTLM recorded, before anything here is built.</td></tr>
-        <tr><td>2</td><td>Mailbox permissions</td><td>The service account must read the Inbox, move messages and send as the mailbox: Full Access plus Send As (simplest), folder-level rights (narrower) or scoped impersonation.</td></tr>
-        <tr><td>3</td><td>Folders</td><td>Assumed: one <code>Processed</code> folder for everything handled. Do invalid invoices need their own <code>Invalid</code> folder, or a <code>Review</code> folder for items a person must check?</td></tr>
-        <tr><td>4</td><td>Email to the sender</td><td>Assumed: a reply to the original sender only, from the invoice mailbox. Fixed templates or AI-written text, and who approves them? Never reply to automatic mail, and cap replies to avoid loops.</td></tr>
+        <tr><td>1</td><td>Prove Exchange and Azure access</td><td>Nothing has run against the customer's Exchange or Azure yet. First, <code>--probe</code> must succeed as the real service account, with Kerberos or NTLM recorded. Then run <code>--run</code> against a test mailbox. Still to confirm live: a new message accepts <code>In-Reply-To</code> and <code>References</code>; lookup by Message-ID; reading the <code>Auto-Submitted</code> header; sending as the mailbox; the folder lookup; and Azure sign-in through Arc.</td></tr>
+        <tr><td>2</td><td>Mailbox permissions</td><td>As built: Full Access plus Send As (simplest). Folder-level rights (narrower) or scoped impersonation remain options.</td></tr>
+        <tr><td>3</td><td>Folders</td><td>As built: the Engine may only name folders listed in <code>Exchange:MoveFolders</code> (default <code>Processed</code>). These must be top-level folders that already exist; the adapter never creates folders. Open: separate <code>Invalid</code> or <code>Review</code> folders, and nested folders.</td></tr>
+        <tr><td>4</td><td>Email to the sender</td><td>As built: plain text from the invoice mailbox to the original From address only. There is one reply per <code>commandId</code>, and no reply goes to automatic mail or to the mailbox itself. Open: fixed templates or AI-written text, who approves them, and a cap on replies per sender.</td></tr>
         <tr><td>5</td><td>Untrusted content</td><td>Email text and attachments are untrusted input to an AI system: they must never choose recipients, folders or commands. Scan for malware; the verdict arrives after upload.</td></tr>
-        <tr><td>6</td><td>Azure sign-in, network</td><td>Managed identity through Azure Arc, or a certificate; never keys. Can the host reach Azure on TCP 5671 or 443 (WebSockets) without a proxy? Private endpoints need Service Bus Premium.</td></tr>
-        <tr><td>7</td><td>Failures, monitoring</td><td>Retries, dead-letter queues, stuck emails, one adapter or a standby. Crash-test every step and prove a reply is never sent twice. Alert on heartbeat, queue depth and oldest Inbox email.</td></tr>
-        <tr><td>8</td><td>Volumes, retention</td><td>Emails per day, largest attachment and required speed set polling, size limits and throttling headroom. How long are invoices kept, and is a legal hold needed?</td></tr>
-        <tr><td>9</td><td>Running as a service</td><td>Windows Service hosting, restart and deployment, the Active Directory service account (today a console app only), separate dev, test and production resources, a test mailbox.</td></tr>
+        <tr><td>6</td><td>Azure sign-in, network</td><td>As built: <code>DefaultAzureCredential</code>, meaning managed identity through Azure Arc or a certificate, never keys. <code>Azure:UseWebSockets</code> moves Service Bus from TCP 5671 to 443. Open: a proxy; private endpoints need Service Bus Premium.</td></tr>
+        <tr><td>7</td><td>Failures, monitoring</td><td>As built: failed emails are retried on the next poll, and commands get a <code>retryable</code> flag. Invalid commands are dead-lettered, and Azure outages are left to Service Bus redelivery. A reply whose outcome is unknown is never resent. Open: crash tests on a test system, a standby adapter (today: one adapter per mailbox), and alerts on heartbeat, queue depth, dead letters and oldest Inbox email.</td></tr>
+        <tr><td>8</td><td>Volumes, retention</td><td>Emails per day, largest attachment and required speed set polling, size limits and throttling headroom. As built, every poll lists the whole Inbox, so moving handled emails keeps it fast. How long are invoices kept, and is a legal hold needed?</td></tr>
+        <tr><td>9</td><td>Running as a service</td><td>As built: <code>--run</code> is registered with <code>sc.exe</code> and logs to the Windows event log. Open: deployment automation, separate dev, test and production resources, a test mailbox, and gMSA.</td></tr>
         <tr><td>10</td><td>Exchange Online later</td><td>EWS is being retired in Exchange Online (from 1 Oct 2026); Microsoft says on-premises Exchange Server is not affected. If the mailbox ever moves, Exchange access switches to Microsoft Graph.</td></tr>
       </tbody>
     </table>

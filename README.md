@@ -1,32 +1,32 @@
 # Exchange Integration Service
 
-A small .NET 10 application that proves, against an **on-premises Exchange Server Subscription Edition (SE)**, that
+A small .NET 10 Windows application that connects one mailbox on an **on-premises Exchange Server Subscription Edition
+(SE)** to an AI Workflow Engine in Azure. It talks to Exchange Web Services (EWS) with **Windows Integrated
+Authentication** and to Azure with Entra ID. One executable has two modes:
 
-1. the Exchange Web Services (EWS) endpoint is reachable over HTTPS,
-2. **Windows Integrated Authentication** with the identity of the running process is accepted, and
-3. that identity can open the **Inbox of one configured mailbox**.
+| Mode | Command | What it does |
+|---|---|---|
+| **Test** | `--probe` | Sends one read-only SOAP `GetFolder` for the Inbox. This proves the EWS endpoint is reachable over HTTPS, the process identity is accepted and that identity can open the configured mailbox. It prints a report and exits with a code per failure category. It needs no Azure. |
+| **Service** | `--run` | Runs until stopped, normally as a Windows service. It copies each new Inbox email's attachments to **Azure Blob Storage**, announces the email on **Azure Service Bus**, and carries out the Engine's `reply` and `move` commands in Exchange. See [Service mode](#service-mode---run). |
 
-It does this with a single read-only SOAP `GetFolder` request and reports what it actually established.
+The design is in [docs/exchange-adapter-engine-integration-design-short.html](docs/exchange-adapter-engine-integration-design-short.html).
 
-> **Status: live Exchange connectivity is NOT YET VERIFIED.**
-> The automated tests use a mocked HTTP transport and a loopback socket server. Nothing in this repository has been run
-> against a real Exchange server. Treat the first successful `--probe` run against the customer's Exchange environment,
-> under the intended identity, as the validation event.
-
-This is the first milestone of a larger Exchange Integration Service (retrieve mail and attachments, store them in Azure
-Blob Storage, move/copy messages, send messages and replies). **Only the authentication and mailbox-access proof of
-concept is implemented here.** Do not start on ingestion or sending until this probe has been validated.
+> **Status: nothing has been verified live.** The automated tests use a mocked HTTP transport, a loopback socket server
+> and in-memory fakes for Azure. Nothing in this repository has run against a real Exchange server or real Azure
+> resources. Validate in this order:
+> 1. A successful `--probe` under the intended identity against the customer's Exchange.
+> 2. `--run` against an approved test mailbox and test Azure resources. See [Not yet verified](#not-yet-verified).
 
 ## What it does and does not do
 
 | Does | Does not |
 |---|---|
-| One read-only `GetFolder` for the Inbox of the configured mailbox | Modify any mailbox content |
-| Windows Integrated Authentication (Negotiate/NTLM) with the process identity | Read message bodies or attachments |
-| Report the Windows identity, HTTP result, EWS response code and a failure category | Store, move, copy, send, poll or synchronize anything |
-| Return a distinct non-zero exit code per failure category | Use Basic authentication, OAuth, Microsoft Graph, IMAP or SMTP |
-| Validate configuration at startup | Change Exchange settings or permissions |
-| Run as a console app, structured for a Windows Service later | Install or deploy a Windows Service |
+| Test mode: one read-only `GetFolder` for the Inbox of the configured mailbox | Test mode: read, change or store any mailbox content |
+| Service mode: read Inbox emails and their file attachments, reply to the original sender, move an email to an allowed folder | Delete email, create folders, mark email as read, or reply to anyone except the original From address |
+| Windows Integrated Authentication (Negotiate/NTLM) with the process identity for Exchange | Use Basic authentication, OAuth, Microsoft Graph, IMAP or SMTP |
+| Entra ID (`DefaultAzureCredential`) for Azure | Use storage keys, SAS tokens or Service Bus connection strings |
+| Validate configuration at startup and report every problem at once | Change Exchange settings or permissions, or create Azure resources |
+| Run as a console app or as a Windows service | Install itself as a service (see [Run as a Windows service](#run-as-a-windows-service)) |
 
 ## Prerequisites
 
@@ -40,8 +40,17 @@ concept is implemented here.** Do not start on ingestion or sending until this p
 - **An identity to authenticate as.** The dedicated Active Directory service identity that the service will eventually
   run as, or an approved development identity.
 - **EWS enabled for that identity**: not switched off or blocked by an EWS access policy or throttling policy.
-- **Mailbox permissions**: the identity must be allowed to see the target mailbox's Inbox (see
-  [Exchange administrator checklist](#exchange-administrator-checklist)).
+- **Mailbox permissions**:
+  - Test mode: the identity must be allowed to see the target mailbox's Inbox.
+  - Service mode: the identity also needs Full Access and Send As.
+
+  See the [Exchange administrator checklist](#exchange-administrator-checklist).
+- **Service mode only:**
+  - An Azure Storage account and a Service Bus namespace with three queues.
+  - Outbound network access from the host.
+  - An Entra ID identity for the host.
+
+  See [Azure setup](#azure-setup).
 
 ## Configuration
 
@@ -54,7 +63,19 @@ Settings come from `appsettings.json` and can be overridden without code changes
     "EwsUrl": "https://mail.contoso.com/EWS/Exchange.asmx",
     "Mailbox": "ap-invoices@contoso.com",
     "AccessMode": "Delegated",
-    "TimeoutSeconds": 30
+    "TimeoutSeconds": 30,
+    "PollIntervalSeconds": 60,
+    "MaxMessagesPerPoll": 20,
+    "MoveFolders": [ "Processed" ]
+  },
+  "Azure": {
+    "BlobServiceUri": "https://contosoinvoices.blob.core.windows.net",
+    "IntakeContainer": "invoice-intake",
+    "ServiceBusNamespace": "contoso-invoices.servicebus.windows.net",
+    "InvoiceReceivedQueue": "invoice-received",
+    "CommandsQueue": "exchange-commands",
+    "CommandResultsQueue": "exchange-command-results",
+    "UseWebSockets": false
   }
 }
 ```
@@ -64,14 +85,26 @@ Settings come from `appsettings.json` and can be overridden without code changes
 | `Exchange:EwsUrl` | `Exchange__EwsUrl` | none, required | Absolute **HTTPS** URL, no embedded user name or password |
 | `Exchange:Mailbox` | `Exchange__Mailbox` | none, required | Plain primary SMTP address, no display name |
 | `Exchange:AccessMode` | `Exchange__AccessMode` | `Delegated` | Only `Delegated` is supported; `Impersonation` is reserved for a later milestone and is rejected |
-| `Exchange:TimeoutSeconds` | `Exchange__TimeoutSeconds` | `30` | 1 to 300; covers the whole request including the authentication handshake |
+| `Exchange:TimeoutSeconds` | `Exchange__TimeoutSeconds` | `30` | 1 to 300; covers each whole EWS request, including the authentication handshake |
+| `Exchange:PollIntervalSeconds` | `Exchange__PollIntervalSeconds` | `60` | Service mode. 5 to 3600; the wait between Inbox polls |
+| `Exchange:MaxMessagesPerPoll` | `Exchange__MaxMessagesPerPoll` | `20` | Service mode. 1 to 500; new emails captured per poll, oldest first. The rest wait for the next poll |
+| `Exchange:MoveFolders` | `Exchange__MoveFolders__0`, `__1`, ... | `["Processed"]` | Service mode. The only folders a `move` command may name. These are display names of **top-level** folders (siblings of the Inbox) that already exist; paths are rejected |
+| `Azure:BlobServiceUri` | `Azure__BlobServiceUri` | none, required in service mode | `https://<account>.blob.core.windows.net`, with no SAS token |
+| `Azure:IntakeContainer` | `Azure__IntakeContainer` | `invoice-intake` | Existing container |
+| `Azure:ServiceBusNamespace` | `Azure__ServiceBusNamespace` | none, required in service mode | Host name such as `<namespace>.servicebus.windows.net`, not a connection string |
+| `Azure:InvoiceReceivedQueue` | `Azure__InvoiceReceivedQueue` | `invoice-received` | Existing queue, adapter → Engine |
+| `Azure:CommandsQueue` | `Azure__CommandsQueue` | `exchange-commands` | Existing queue, Engine → adapter |
+| `Azure:CommandResultsQueue` | `Azure__CommandResultsQueue` | `exchange-command-results` | Existing queue, adapter → Engine |
+| `Azure:UseWebSockets` | `Azure__UseWebSockets` | `false` | `true` sends Service Bus traffic as AMQP over WebSockets on TCP 443 instead of AMQP on TCP 5671 |
 | `Logging:LogLevel:Default` | `Logging__LogLevel__Default` | `Information` | Use `Debug` for more detail |
 
-The values shipped in `appsettings.json` are **placeholders** (`contoso.com`). Replace them with environment variables or
-a local override file. `appsettings.*.json` files other than `appsettings.json` are git-ignored so real host and mailbox
-names are not committed by accident.
+Test mode ignores the `Azure` section and the service-mode `Exchange` settings.
 
-All problems are reported at once, before anything is sent to Exchange, for example:
+The values shipped in `appsettings.json` are **placeholders** (`contoso.com`, `contosoinvoices`). Replace them with
+environment variables or a local override file. `appsettings.*.json` files other than `appsettings.json` are git-ignored,
+so real host, mailbox and Azure resource names are not committed by accident.
+
+All problems are reported at once, before anything is sent to Exchange or Azure, for example:
 
 ```text
 Configuration errors (nothing was sent to Exchange):
@@ -99,7 +132,8 @@ service account, start the process as that account; see
 
 A published build runs the same way: `dotnet publish -c Release -o <folder>`, then `<folder>\ExchangeIntegration.exe --probe`.
 
-- `--probe` runs the one-time test and exits. `--help` prints usage. Running without arguments prints usage and exits with 64.
+- `--probe` runs the one-time test and exits. `--run` starts service mode (see [Service mode](#service-mode---run)).
+  `--help` prints usage. Running with neither or both prints usage and exits with 64.
 - The report goes to **stdout**; structured logs go to **stderr**. Capture them separately with
   `dotnet run -- --probe 2> probe.log`.
 
@@ -175,8 +209,11 @@ Overall: FAILURE (exit code 5)
 | 11 | `UnexpectedRedirect` | The endpoint redirected; redirects are never followed | Configuration / Exchange authentication |
 | 12 | `UnexpectedHttpStatus` | A status that is not an EWS response (404, 5xx, 407, ...) | Exchange service / network |
 | 13 | `EwsError` | EWS returned another error code (kept verbatim in the report) | Exchange service |
-| 64 | - | Usage error: no command given | - |
+| 64 | - | Usage error: no command, or both `--probe` and `--run` | - |
 | 130 | `Cancelled` | Cancelled with Ctrl+C | - |
+
+These codes describe test mode. Service mode exits with 0 when stopped, 2 for invalid configuration and 1 for an
+unexpected startup error. Exchange and Azure failures while it runs are logged and retried, and do not stop it.
 
 ### Run the probe under the intended identity
 
@@ -228,6 +265,209 @@ all differ. Repeat the probe as the real identity, on the real host, before rely
      the probe on a host that can log on the account, or have an administrator run it as that account by an approved
      method, such as a scheduled task that writes the output to a file. Never put the password in a script or on a
      command line.
+
+## Service mode (`--run`)
+
+Service mode runs two independent loops until it is stopped.
+
+```mermaid
+flowchart LR
+    Inbox[(Exchange Inbox)] -- "1 poll (EWS)" --> Adapter[Exchange Adapter --run]
+    Adapter -- "2 attachments + manifest.json" --> Blob[(Blob: invoice-intake)]
+    Adapter -- "3 invoice.received" --> Q1[[invoice-received]]
+    Q1 --> Engine[AI Workflow Engine]
+    Engine -- "4 reply / move" --> Q2[[exchange-commands]]
+    Q2 --> Adapter
+    Adapter -- "5 reply or move (EWS)" --> Inbox
+    Adapter -- "6 exchange.command.result" --> Q3[[exchange-command-results]]
+    Q3 --> Engine
+```
+
+**Ingestion (Exchange → Azure)**, every `PollIntervalSeconds`:
+
+1. **List the Inbox.** The adapter lists the Inbox oldest first: up to 50 pages of 200, plus each email's Message-ID.
+   - Only emails (`IPM.Note*`) are considered.
+   - An email without a Message-ID header is left alone and counted in a warning.
+   - Emails are never changed or marked as read.
+2. **Skip known emails.** Each email gets a `messageKey`: the first 32 hex characters of SHA-256 over the lower-cased
+   mailbox, a newline and the Message-ID. An email whose `<messageKey>/manifest.json` is already marked announced is
+   skipped.
+3. **Capture.** Up to `MaxMessagesPerPoll` new emails are captured per poll:
+   - Each file attachment goes to `<messageKey>/attachments/NN-<safe-name>`.
+   - Attached emails (item attachments) are counted in the manifest but not stored.
+   - Then `<messageKey>/manifest.json` is written.
+4. **Announce.** One `invoice.received` message goes to Service Bus, with the Service Bus `MessageId` set to the
+   `messageKey`.
+5. **Checkpoint.** Only after the announcement does the adapter set the manifest's `announcedutc` blob metadata. That
+   metadata is the only checkpoint: there is no database or local state.
+   - After a crash, the email is captured and announced again.
+   - Service Bus duplicate detection drops the repeat inside its window, and the Engine must treat `invoice.received` as
+     idempotent anyway.
+   - A failure on one email is logged and that email is retried on the next poll, without blocking the others.
+
+**Commands (Azure → Exchange)** are processed one at a time from `exchange-commands`:
+
+1. **Settle malformed messages.** A message that is not JSON, or has no well-formed `commandId`, is dead-lettered
+   because no result could be correlated with it.
+2. **Validate.** Every other command gets exactly one `exchange.command.result`. The checks are:
+   - `type` is `exchange.command.reply` or `exchange.command.move`.
+   - `mailbox` is the configured mailbox.
+   - `messageKey` matches the mailbox and `internetMessageId`.
+   - `commandId` is `<messageKey>.<suffix>`.
+   - For a move, the folder is in `Exchange:MoveFolders`.
+   - For a reply, the text is non-empty and at most 20,000 characters.
+3. **Find the email.** The email is looked up in the Inbox by Message-ID. If it is not there, the result is `failed`
+   ("already moved or deleted").
+4. **Move.** The email moves to the named top-level folder. If several Inbox items share the Message-ID, only the
+   first (oldest) is moved or replied to; the others stay in the Inbox and a warning is logged.
+5. **Reply.** The reply is a **new** plain-text email sent as the mailbox. It goes **only to the original From
+   address**; a `Reply-To` header is ignored because email content is untrusted. It has an `RE:` subject and
+   `In-Reply-To`/`References` headers, and a copy is saved in Sent Items.
+   - It is refused when the email came from the mailbox itself or carries an `Auto-Submitted` header other than `no`
+     (loop guards).
+6. **Record the outcome.** A command record at `<messageKey>/commands/<commandId>.json` makes repeats safe:
+   - A command that already succeeded just republishes its stored result.
+   - A reply is sent **at most once**. A `started` record is written before sending and stays if the outcome is unknown
+     (for example a timeout), so a redelivered command reports `failed` with "check Sent Items" instead of sending again.
+7. **Retry or fail.**
+   - A transient EWS failure gives `failed` with `retryable: true`.
+   - If Azure itself fails (the record or the result cannot be written), the message is abandoned. Service Bus then
+     redelivers it up to the queue's max delivery count, then dead-letters it.
+
+### Messages and blobs
+
+All JSON is camelCase. Email content (sender, subject, file names) is **untrusted** input to the Engine.
+
+```jsonc
+// invoice-received queue: adapter → Engine
+{
+  "type": "invoice.received",
+  "messageKey": "3f9a1c0e5b7d4a62c1e0f9b8a7d6c5e4",
+  "mailbox": "ap-invoices@contoso.com",
+  "internetMessageId": "<CAB123@vendor.example>",
+  "receivedUtc": "2026-11-02T14:03:11+00:00",
+  "manifest": "https://contosoinvoices.blob.core.windows.net/invoice-intake/3f9a1c0e5b7d4a62c1e0f9b8a7d6c5e4/manifest.json"
+}
+
+// <messageKey>/manifest.json in the intake container
+{
+  "messageKey": "3f9a1c0e5b7d4a62c1e0f9b8a7d6c5e4",
+  "mailbox": "ap-invoices@contoso.com",
+  "internetMessageId": "<CAB123@vendor.example>",
+  "receivedUtc": "2026-11-02T14:03:11+00:00",
+  "from": "billing@vendor.example",
+  "subject": "Invoice 4711",
+  "files": [
+    { "name": "Invoice 4711.pdf", "blob": "3f9a1c0e5b7d4a62c1e0f9b8a7d6c5e4/attachments/01-Invoice_4711.pdf",
+      "contentType": "application/pdf", "size": 48213, "isInline": false }
+  ],
+  "skippedAttachments": 0,
+  "capturedUtc": "2026-11-02T14:03:40+00:00"
+}
+
+// exchange-commands queue: Engine → adapter (reply)
+{
+  "type": "exchange.command.reply",
+  "commandId": "3f9a1c0e5b7d4a62c1e0f9b8a7d6c5e4.reply",
+  "messageKey": "3f9a1c0e5b7d4a62c1e0f9b8a7d6c5e4",
+  "internetMessageId": "<CAB123@vendor.example>",
+  "mailbox": "ap-invoices@contoso.com",
+  "reply": { "bodyText": "Please add the PO number and send the invoice again." }
+}
+
+// exchange-commands queue: Engine → adapter (move)
+{
+  "type": "exchange.command.move",
+  "commandId": "3f9a1c0e5b7d4a62c1e0f9b8a7d6c5e4.move",
+  "messageKey": "3f9a1c0e5b7d4a62c1e0f9b8a7d6c5e4",
+  "internetMessageId": "<CAB123@vendor.example>",
+  "mailbox": "ap-invoices@contoso.com",
+  "move": { "folder": "Processed" }
+}
+
+// exchange-command-results queue: adapter → Engine (Service Bus CorrelationId = commandId)
+{
+  "type": "exchange.command.result",
+  "commandId": "3f9a1c0e5b7d4a62c1e0f9b8a7d6c5e4.move",
+  "messageKey": "3f9a1c0e5b7d4a62c1e0f9b8a7d6c5e4",
+  "status": "failed",
+  "reason": "The email is not in the Inbox (already moved or deleted).",
+  "retryable": false,
+  "completedUtc": "2026-11-02T14:05:02+00:00"
+}
+```
+
+The `commandId` suffix is 1 to 64 characters of `A-Z a-z 0-9 _ -`. Reusing a `commandId` returns the first result
+instead of acting again, so use a new suffix (for example `.reply2`) for a deliberate second reply. A typical flow:
+
+- A valid invoice gets a `move`.
+- An invalid invoice gets a `reply` and then, after its `succeeded` result, a `move`.
+
+### Azure setup
+
+Create these resources up front; the adapter never creates them.
+
+| Resource | Settings | Adapter identity needs | Engine identity needs |
+|---|---|---|---|
+| Storage container `invoice-intake` | Private; consider soft delete and Defender for Storage malware scanning | Storage Blob Data Contributor (container scope) | Storage Blob Data Reader |
+| Queue `invoice-received` | **Duplicate detection on** (it can only be set when the queue is created) | Azure Service Bus Data Sender | Azure Service Bus Data Receiver |
+| Queue `exchange-commands` | Default lock duration and max delivery count are fine; the processor renews the lock | Azure Service Bus Data Receiver | Azure Service Bus Data Sender |
+| Queue `exchange-command-results` | Defaults | Azure Service Bus Data Sender | Azure Service Bus Data Receiver |
+
+Duplicate detection needs the Standard tier or higher. Messages are small, because they only point at blobs.
+
+**Identity.** There are no keys or connection strings. The adapter uses `DefaultAzureCredential`, which tries these in
+order:
+
+- **Environment variables.** For example a certificate registered to an app in Entra ID: `AZURE_TENANT_ID`,
+  `AZURE_CLIENT_ID` and `AZURE_CLIENT_CERTIFICATE_PATH`.
+- **Managed identity.** On an on-premises host, this means connecting the host to **Azure Arc** and granting its managed
+  identity the roles above. On Windows, the service account must be a member of the local
+  **Hybrid agent extension applications** group (or Administrators) to obtain Arc tokens.
+- **Developer sign-ins.** Visual Studio and Azure CLI work for local testing.
+
+**Network.** The host only makes outbound connections. It needs:
+
+- HTTPS (443) to the blob endpoint and to Entra ID.
+- AMQP (5671) to Service Bus, or 443 with `Azure:UseWebSockets=true`.
+
+### Run as a Windows service
+
+```powershell
+dotnet publish -c Release -o C:\Services\ExchangeIntegration
+
+# Once, as an administrator: lets the service write warnings and errors to the Application event log.
+New-EventLog -LogName Application -Source ExchangeIntegration
+
+sc.exe create ExchangeIntegration binPath= "C:\Services\ExchangeIntegration\ExchangeIntegration.exe --run" start= delayed-auto
+sc.exe failure ExchangeIntegration reset= 86400 actions= restart/60000/restart/60000/restart/300000
+```
+
+Then set the service's **Log On** account to the service identity in `services.msc`; the account needs the
+"Log on as a service" right. Put the real settings in machine-level environment variables or in `appsettings.json` next
+to the executable. Start the service.
+
+- `Exchange` uses the service identity's Windows credentials.
+- `Azure` uses `DefaultAzureCredential`.
+- As a service, warnings and errors go to the Application event log (source `ExchangeIntegration`).
+- To watch it work, stop the service and run `ExchangeIntegration.exe --run` in a console as the same identity. Logs
+  then go to stderr.
+
+Run **one** adapter per mailbox. Two instances would capture the same emails twice (harmless, because of duplicate
+detection) and would split commands between them.
+
+### Not yet verified
+
+The service-mode EWS requests follow the EWS schema but have only been tested against recorded responses. Check these
+against the customer's Exchange with a test mailbox before production:
+
+- A new message accepts `InReplyTo` and `References`, so the reply threads in the sender's mail client.
+- Setting `From` to the mailbox and sending with `SendAndSaveCopy` works with **Send As**, and the copy lands in the
+  mailbox's Sent Items.
+- `FindItem` with a restriction on `message:InternetMessageId` finds the email.
+- `GetItem` returns `item:InternetMessageHeaders`, which the `Auto-Submitted` loop guard needs.
+- `FindFolder` under `msgfolderroot` finds the `MoveFolders` by display name.
+- `DefaultAzureCredential` obtains tokens through Azure Arc under the service account.
 
 ## Kerberos versus NTLM
 
@@ -299,11 +539,24 @@ for the Exchange administrator, using the customer's change process for any fix.
 
    Folder-level permissions can typically be granted only to mail-enabled principals (a mailbox, mail user or
    mail-enabled security group), whereas Full Access can be granted to any security principal such as a service account;
-   agree the model with the customer. Later milestones need more rights than this one (read, move or copy, and send each
-   need their own), so decide those before building them.
+   agree the model with the customer.
+
+   **Service mode needs more than the probe:**
+   - **Full Access**, to read emails and attachments and to move emails.
+   - **Send As**, because the reply is sent as the mailbox.
+   - Every folder in `Exchange:MoveFolders` (by default `Processed`) must already exist as a top-level folder of the
+     mailbox, next to the Inbox.
+
+   ```powershell
+   Get-ADPermission -Identity ap-invoices@contoso.com -User 'CONTOSO\svc-invoiceews' | Where-Object { $_.ExtendedRights -like '*Send-As*' }
+   Get-MailboxFolderStatistics -Identity ap-invoices@contoso.com -FolderScope All | Where-Object { $_.FolderPath -eq '/Processed' }
+   ```
 4. **EWS access policies.** EWS can be switched off, or restricted to allow/block lists matched against the client
-   **User-Agent**. Check the organization and both the service identity and the target mailbox. The probe sends
-   `User-Agent: ExchangeIntegration-EwsProbe/1.0`. Also review the throttling policy applied to the service identity.
+   **User-Agent**. Check the organization and both the service identity and the target mailbox.
+   - The probe sends `User-Agent: ExchangeIntegration-EwsProbe/1.0`.
+   - Service mode sends `ExchangeIntegration-Adapter/1.0`.
+
+   Also review the throttling policy applied to the service identity.
 
    ```powershell
    Get-OrganizationConfig | Format-List EwsEnabled, EwsApplicationAccessPolicy, EwsAllowList, EwsBlockList
@@ -321,7 +574,7 @@ for the Exchange administrator, using the customer's change process for any fix.
 6. **Unattended service account eligibility.** The identity must be able to authenticate with no person present:
    - the account: enabled, password that does not expire unexpectedly, no smart card required, no logon-hour
      restriction, and not a member of the Protected Users group (it blocks NTLM);
-   - the right to log on as a service (the future service) or as a batch job (a scheduled-task test) on the host;
+   - the right to log on as a service (service mode) or as a batch job (a scheduled-task probe) on the host;
    - clocks within the Kerberos tolerance (5 minutes by default) of the domain, and HTTPS (TCP 443) reachable from the host.
 
 ## Troubleshooting
@@ -364,6 +617,23 @@ and cancellation; TLS and DNS failures; invalid configuration and environment/ar
 A loopback socket server exercises the **real** `HttpClientHandler` to prove that redirects are not followed and that a
 `Basic` or `Digest` challenge is never answered, so there is no insecure authentication fallback. Other tests assert that
 logs and reports never contain bodies, tokens or the full folder identifier.
+
+Service mode is tested without Exchange or Azure:
+
+- **EWS requests.** `EwsMailbox` is checked against recorded EWS responses for paging, attachment decoding, the reply's
+  element order, folder lookup and error classification.
+- **Ingestion and commands.** These run against in-memory fakes of the mailbox, Blob Storage and Service Bus. The tests
+  cover:
+  - capture order and the restart checkpoint;
+  - retry after a failed announcement;
+  - the per-poll cap;
+  - every command validation rule;
+  - idempotent repeats;
+  - the at-most-once reply;
+  - the loop guards;
+  - dead-lettering.
+
+The JSON contracts and the dependency injection wiring for both modes are covered too.
 
 ### Optional live integration tests (customer-approved test mailbox)
 
@@ -416,10 +686,20 @@ The same check exists as a live test: set `EXCHANGE_LIVE_TESTS=1` and
 - **Impersonation later:** `ExchangeAccessMode` reserves `Impersonation` (currently rejected), `EwsRequestBuilder` is the
   single place SOAP headers are produced (where `ExchangeImpersonation` will go), and `IEwsClient` takes the mailbox per
   call so scope can be decided per mailbox.
-- **Windows Service later:** `Program.cs` is a Generic Host composition root and `AddExchangeIntegration` registers the
-  services. Running as a service will add the `Microsoft.Extensions.Hosting.WindowsServices` package, `AddWindowsService()`
-  and `BackgroundService` workers. Configuration is already resolved relative to the application directory, which is what
-  a service needs because its working directory is `System32`.
+- **Two modes, one composition root:** `Program.cs` requires exactly one of `--probe` or `--run`.
+  - `AddExchangeIntegration` registers the probe.
+  - `AddExchangeAdapter` adds the Azure clients, `AddWindowsService()` and the two `BackgroundService` workers,
+    `IngestionWorker` and `CommandWorker`.
+  - Configuration is resolved relative to the application directory, which a service needs because its working
+    directory is `System32`.
+- **Service mode stays small on purpose:**
+  - There is no database and no local state; the blob manifest and command records are the checkpoints.
+  - Commands run one at a time.
+  - The Inbox is re-listed on every poll, so the Engine must keep it short by moving handled emails.
+  - Service mode uses its own `HttpClient`, with the same Windows authentication, no redirects and TLS rules, and a 128 MB
+    response limit for attachments.
+- **Untrusted email:** nothing in an email chooses a recipient, folder or command. The reply recipient is the From
+  address, folders come from configuration, and logs contain only message keys, never addresses, subjects or file names.
 
 ## Project layout
 
@@ -427,28 +707,34 @@ The same check exists as a live test: set `EXCHANGE_LIVE_TESTS=1` and
 ExchangeIntegration.slnx
 global.json
 ExchangeIntegration.csproj
-Program.cs                      Host composition root and the --probe command
+Program.cs                      Host composition root: --probe (test mode) and --run (service mode)
 appsettings.json                Placeholder settings
-Configuration/                  ExchangeOptions, startup validation, service registration
+Configuration/                  ExchangeOptions, AzureOptions, startup validation, service registration
 Authentication/                 ExchangeHttpClientFactory (Windows authentication), process identity
-Exchange/                       IEwsClient, EwsClient, EwsRequestBuilder, EwsResponseParser, failure categories, redaction
+Exchange/                       IEwsClient/EwsClient (probe), IExchangeMailbox/EwsMailbox (service), SOAP builder and parser, failure categories, redaction
 Diagnostics/                    ExchangeConnectivityProbe, ConnectivityResult, console report
-ExchangeIntegration.Tests/      xUnit tests (mocked HTTP transport, loopback server, opt-in live tests)
+Adapter/                        Service mode: JSON contracts, message keys, ingestion, command handling, the two workers
+Cloud/                          Blob Storage and Service Bus implementations of the adapter's ports
+docs/                           Design document
+ExchangeIntegration.Tests/      xUnit tests (mocked HTTP transport, loopback server, in-memory fakes, opt-in live tests)
 ```
 
-## Explicitly out of scope for this milestone
+## Explicitly out of scope for this version
 
-Email synchronization or polling; reading message bodies or attachments; Azure Blob Storage; moving or copying email;
-sending email or replies; Microsoft Graph; IMAP or SMTP; OAuth; Service Bus; database persistence; Windows Service
-installation or deployment automation; Exchange administration changes.
+Microsoft Graph; IMAP or SMTP; OAuth for Exchange; EWS impersonation; a database; nested move folders or creating
+folders; reply templates, HTML replies or attachments on replies; a standby adapter; installer or deployment automation;
+metrics and alerting beyond logs; Exchange administration changes.
 
-Deferred for now: running under a group Managed Service Account (gMSA). It is not documented or tested in this
-milestone. The application does not select or restrict the identity (it uses the identity of the process), so this is a
-scope decision for the documentation, not a limitation enforced by the code.
+Deferred for now: running under a group Managed Service Account (gMSA). It is not documented or tested yet. The
+application does not select or restrict the identity (it uses the identity of the process), so this is a scope decision
+for the documentation, not a limitation enforced by the code.
 
 ## Recommended next step
 
 1. Run the probe under the intended identity on the intended host against the customer's Exchange, record the observed
    protocol (Kerberos or NTLM), and run the negative test with an approved mailbox. Only then mark live connectivity verified.
-2. Next milestone: **read-only message retrieval** from approved mailboxes (find new items, read messages and
-   attachments) with paging, throttling and back-off handling, and no storage yet.
+2. Grant Full Access and Send As on an approved **test** mailbox, create test Azure resources (see
+   [Azure setup](#azure-setup)), and run `--run` in a console as the service identity.
+3. Work through the [Not yet verified](#not-yet-verified) list by hand: send test invoices to the mailbox and put
+   `reply` and `move` commands on `exchange-commands`. Then build the Engine side against the
+   [messages](#messages-and-blobs).

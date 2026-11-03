@@ -9,7 +9,9 @@ using Microsoft.Extensions.Logging.Console;
 using Microsoft.Extensions.Options;
 
 const string ProbeSwitch = "--probe";
+const string RunSwitch = "--run";
 const int UsageExitCode = 64;
+const int ConfigurationExitCode = (int)FailureCategory.Configuration;
 
 if (args.Any(IsHelpSwitch))
 {
@@ -17,9 +19,11 @@ if (args.Any(IsHelpSwitch))
     return 0;
 }
 
-if (!args.Any(arg => string.Equals(arg, ProbeSwitch, StringComparison.OrdinalIgnoreCase)))
+var probeMode = args.Any(arg => string.Equals(arg, ProbeSwitch, StringComparison.OrdinalIgnoreCase));
+var runMode = args.Any(arg => string.Equals(arg, RunSwitch, StringComparison.OrdinalIgnoreCase));
+if (probeMode == runMode)
 {
-    Console.Error.WriteLine("No command was specified.");
+    Console.Error.WriteLine(probeMode ? "Specify either --probe or --run, not both." : "No command was specified.");
     Console.Error.WriteLine();
     WriteUsage(Console.Error);
     return UsageExitCode;
@@ -27,11 +31,12 @@ if (!args.Any(arg => string.Equals(arg, ProbeSwitch, StringComparison.OrdinalIgn
 
 // The command switch is not configuration; everything else (for example --Exchange:Mailbox=...) goes to the host.
 var configurationArgs = args
-    .Where(arg => !string.Equals(arg, ProbeSwitch, StringComparison.OrdinalIgnoreCase))
+    .Where(arg => !string.Equals(arg, ProbeSwitch, StringComparison.OrdinalIgnoreCase)
+        && !string.Equals(arg, RunSwitch, StringComparison.OrdinalIgnoreCase))
     .ToArray();
 
 // Resolving appsettings.json against the binary directory keeps it found when the working directory differs,
-// which is also what a Windows service needs later (its working directory is System32).
+// which is also what a Windows service needs (its working directory is System32).
 var builder = Host.CreateApplicationBuilder(new HostApplicationBuilderSettings
 {
     Args = configurationArgs,
@@ -47,8 +52,11 @@ builder.Logging.AddSimpleConsole(options =>
 });
 builder.Services.Configure<ConsoleLoggerOptions>(options => options.LogToStandardErrorThreshold = LogLevel.Trace);
 
-// Later milestones register their BackgroundService workers here and call AddWindowsService() once the
-// application runs as a Windows service.
+if (runMode)
+{
+    return await RunServiceAsync(builder);
+}
+
 builder.Services.AddExchangeIntegration(builder.Configuration);
 
 using var host = builder.Build();
@@ -90,6 +98,44 @@ catch (Exception exception)
 
 static bool IsHelpSwitch(string arg) => arg is "--help" or "-h" or "-?" or "/?";
 
+// Service mode: poll the Inbox and process Engine commands until Ctrl+C or a Windows service stop.
+static async Task<int> RunServiceAsync(HostApplicationBuilder builder)
+{
+    // Under the Service Control Manager this adds the Windows Event Log (source "ExchangeIntegration") and
+    // service lifetime; in a console it does nothing.
+    builder.Services.AddWindowsService(options => options.ServiceName = "ExchangeIntegration");
+
+    try
+    {
+        builder.Services.AddExchangeAdapter(builder.Configuration);
+        using var host = builder.Build();
+        await host.RunAsync();
+        return 0;
+    }
+    catch (Exception exception) when (ConfigurationFailures(exception) is { Count: > 0 } failures)
+    {
+        Console.Error.WriteLine("Configuration errors:");
+        foreach (var failure in failures)
+        {
+            Console.Error.WriteLine($"  - {Redaction.SanitizeMessage(failure)}");
+        }
+
+        return ConfigurationExitCode;
+    }
+    catch (Exception exception)
+    {
+        Console.Error.WriteLine($"Unexpected error: {exception.GetType().Name}: {Redaction.SanitizeMessage(exception.Message)}");
+        return (int)FailureCategory.Unexpected;
+    }
+}
+
+static List<string> ConfigurationFailures(Exception exception) => exception switch
+{
+    OptionsValidationException validation => validation.Failures.ToList(),
+    AggregateException aggregate => aggregate.Flatten().InnerExceptions.SelectMany(ConfigurationFailures).ToList(),
+    _ => [],
+};
+
 static int Write(ConnectivityResult result)
 {
     Console.Out.Write(ConnectivityReport.Render(result));
@@ -98,16 +144,19 @@ static int Write(ConnectivityResult result)
 
 static void WriteUsage(TextWriter writer)
 {
-    writer.WriteLine("Exchange Integration - read-only EWS connectivity and Windows authentication probe");
+    writer.WriteLine("Exchange Integration - EWS adapter between an on-premises Exchange mailbox and Azure");
     writer.WriteLine();
     writer.WriteLine("Usage:");
     writer.WriteLine("  ExchangeIntegration --probe [--Exchange:EwsUrl=<url>] [--Exchange:Mailbox=<address>]");
+    writer.WriteLine("  ExchangeIntegration --run   [--<Section>:<Key>=<value> ...]");
     writer.WriteLine();
     writer.WriteLine("Options:");
-    writer.WriteLine("  --probe   Run the one-time connectivity test and exit. The exit code is 0 only on success.");
+    writer.WriteLine("  --probe   Test mode: run the one-time read-only connectivity test and exit. The exit code is 0 only on success.");
+    writer.WriteLine("  --run     Service mode: capture new Inbox emails to Azure and carry out Engine commands until stopped.");
+    writer.WriteLine("            This is the mode to register as a Windows service.");
     writer.WriteLine("  --help    Show this help.");
     writer.WriteLine();
     writer.WriteLine("Settings come from appsettings.json and can be overridden with environment variables such as");
-    writer.WriteLine("Exchange__EwsUrl and Exchange__Mailbox, or with the --Exchange:<Key>=<value> arguments above.");
+    writer.WriteLine("Exchange__EwsUrl, Exchange__Mailbox and Azure__BlobServiceUri, or with --<Section>:<Key>=<value> arguments.");
     writer.WriteLine("See README.md for the exit codes and troubleshooting.");
 }

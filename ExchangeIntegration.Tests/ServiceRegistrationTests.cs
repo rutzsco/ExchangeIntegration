@@ -1,4 +1,7 @@
+using Azure.Storage.Blobs;
+using ExchangeIntegration.Adapter;
 using ExchangeIntegration.Authentication;
+using ExchangeIntegration.Cloud;
 using ExchangeIntegration.Configuration;
 using ExchangeIntegration.Diagnostics;
 using ExchangeIntegration.Exchange;
@@ -42,27 +45,118 @@ public class ServiceRegistrationTests
         ["Exchange__Mailbox"] = null,
         ["Exchange__AccessMode"] = null,
         ["Exchange__TimeoutSeconds"] = null,
+        ["Exchange__PollIntervalSeconds"] = null,
+        ["Exchange__MaxMessagesPerPoll"] = null,
+        ["Exchange__MoveFolders__0"] = null,
+        ["Azure__BlobServiceUri"] = null,
+        ["Azure__IntakeContainer"] = null,
+        ["Azure__ServiceBusNamespace"] = null,
+        ["Azure__InvoiceReceivedQueue"] = null,
+        ["Azure__CommandsQueue"] = null,
+        ["Azure__CommandResultsQueue"] = null,
+        ["Azure__UseWebSockets"] = null,
     };
 
-    private static ServiceProvider BuildProvider(Dictionary<string, string?> settings)
+    private static readonly Dictionary<string, string?> ValidServiceSettings = new()
+    {
+        ["Exchange:EwsUrl"] = "https://mail.contoso.com/EWS/Exchange.asmx",
+        ["Exchange:Mailbox"] = "ap-invoices@contoso.com",
+        ["Azure:BlobServiceUri"] = "https://contosoinvoices.blob.core.windows.net",
+        ["Azure:ServiceBusNamespace"] = "contoso-invoices.servicebus.windows.net",
+    };
+
+    private static ServiceProvider BuildProvider(Dictionary<string, string?> settings, bool serviceMode = false)
     {
         var configuration = new ConfigurationBuilder().AddInMemoryCollection(settings).Build();
         var services = new ServiceCollection();
         services.AddLogging();
-        services.AddExchangeIntegration(configuration);
+        if (serviceMode)
+        {
+            services.AddExchangeAdapter(configuration);
+        }
+        else
+        {
+            services.AddExchangeIntegration(configuration);
+        }
+
         return services.BuildServiceProvider();
     }
 
     // The same call Program.cs uses, so these tests cover appsettings.json, environment variables and arguments.
-    private static IHost BuildHost(params string[] args)
+    private static IHost BuildHost(params string[] args) => BuildHost(serviceMode: false, args);
+
+    private static IHost BuildHost(bool serviceMode, params string[] args)
     {
         var builder = Host.CreateApplicationBuilder(new HostApplicationBuilderSettings
         {
             Args = args,
             ContentRootPath = AppContext.BaseDirectory,
         });
-        builder.Services.AddExchangeIntegration(builder.Configuration);
+        if (serviceMode)
+        {
+            builder.Services.AddExchangeAdapter(builder.Configuration);
+        }
+        else
+        {
+            builder.Services.AddExchangeIntegration(builder.Configuration);
+        }
+
         return builder.Build();
+    }
+
+    [Fact]
+    public async Task Service_mode_resolves_both_workers_and_the_azure_adapters()
+    {
+        await using var provider = BuildProvider(ValidServiceSettings, serviceMode: true);
+
+        var workers = provider.GetServices<IHostedService>().ToList();
+
+        Assert.Contains(workers, worker => worker is IngestionWorker);
+        Assert.Contains(workers, worker => worker is CommandWorker);
+        Assert.IsType<EwsMailbox>(provider.GetRequiredService<IExchangeMailbox>());
+        Assert.IsType<BlobInvoiceStore>(provider.GetRequiredService<IInvoiceStore>());
+        Assert.IsType<ServiceBusEngineQueues>(provider.GetRequiredService<IEngineQueues>());
+        Assert.Equal("invoice-intake", provider.GetRequiredService<BlobContainerClient>().Name);
+    }
+
+    [Fact]
+    public async Task Service_mode_requires_the_azure_settings()
+    {
+        await using var provider = BuildProvider(
+            new Dictionary<string, string?>
+            {
+                ["Exchange:EwsUrl"] = "https://mail.contoso.com/EWS/Exchange.asmx",
+                ["Exchange:Mailbox"] = "ap-invoices@contoso.com",
+            },
+            serviceMode: true);
+
+        var exception = Assert.Throws<OptionsValidationException>(() => provider.GetRequiredService<IOptions<AzureOptions>>().Value);
+
+        Assert.Equal(2, exception.Failures.Count());
+    }
+
+    [Fact]
+    public void Probe_mode_registers_no_workers()
+    {
+        using var provider = BuildProvider(ValidServiceSettings);
+
+        Assert.Empty(provider.GetServices<IHostedService>());
+    }
+
+    [Fact]
+    public void The_shipped_appsettings_json_binds_to_valid_service_mode_options()
+    {
+        using var environment = new EnvironmentVariableScope(NoExchangeVariables);
+        using var host = BuildHost(serviceMode: true);
+
+        var exchange = host.Services.GetRequiredService<IOptions<ExchangeOptions>>().Value;
+        var azure = host.Services.GetRequiredService<IOptions<AzureOptions>>().Value;
+
+        Assert.Empty(AzureOptionsValidator.GetFailures(azure));
+        Assert.Equal(["Processed"], exchange.GetMoveFolders());
+        Assert.Equal(ExchangeOptions.DefaultPollIntervalSeconds, exchange.PollIntervalSeconds);
+        Assert.Equal("exchange-commands", azure.CommandsQueue);
+        Assert.False(azure.UseWebSockets);
     }
 
     [Fact]
