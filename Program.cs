@@ -49,6 +49,7 @@ builder.Logging.AddSimpleConsole(options =>
 {
     options.SingleLine = true;
     options.TimestampFormat = "HH:mm:ss ";
+    options.IncludeScopes = true;
 });
 builder.Services.Configure<ConsoleLoggerOptions>(options => options.LogToStandardErrorThreshold = LogLevel.Trace);
 
@@ -144,7 +145,7 @@ static int Write(ConnectivityResult result)
 
 static void WriteUsage(TextWriter writer)
 {
-    writer.WriteLine("Exchange Integration - EWS adapter between an on-premises Exchange mailbox and Azure");
+    writer.WriteLine("Exchange Integration - EWS adapter between on-premises Exchange mailboxes and Azure");
     writer.WriteLine();
     writer.WriteLine("Usage:");
     writer.WriteLine("  ExchangeIntegration --probe [--Exchange:EwsUrl=<url>] [--Exchange:Mailbox=<address>]");
@@ -158,5 +159,8 @@ static void WriteUsage(TextWriter writer)
     writer.WriteLine();
     writer.WriteLine("Settings come from appsettings.json and can be overridden with environment variables such as");
     writer.WriteLine("Exchange__EwsUrl, Exchange__Mailbox and Azure__BlobServiceUri, or with --<Section>:<Key>=<value> arguments.");
+    writer.WriteLine("Service mode also accepts Exchange:Mailboxes, a list of independent Exchange configurations.");
+    writer.WriteLine("For example, Exchange__Mailboxes__0__Mailbox and Exchange__Mailboxes__0__EwsUrl configure the first.");
+    writer.WriteLine("Test mode still probes only Exchange:Mailbox using Exchange:EwsUrl; it ignores the mailbox list.");
     writer.WriteLine("See README.md for the exit codes and troubleshooting.");
 }

@@ -76,6 +76,41 @@ public class InvoiceIngestionTests
     }
 
     [Fact]
+    public async Task Mailboxes_have_independent_capture_limits_keys_and_checkpoints_in_shared_storage()
+    {
+        const string otherAddress = "invoices-other@contoso.com";
+        const string messageId = "<inv-1001@example.test>";
+        var otherMailbox = new FakeMailbox();
+        foreach (var mailbox in new[] { _mailbox, otherMailbox })
+        {
+            mailbox.AddEmail(messageId);
+            mailbox.AddEmail("<inv-1002@example.test>");
+        }
+        var first = Create(maxMessagesPerPoll: 1);
+        var second = new InvoiceIngestion(
+            otherMailbox, _store, _queues,
+            Options.Create(new ExchangeOptions { Mailbox = otherAddress, MaxMessagesPerPoll = 2 }),
+            new FixedTimeProvider(Now), _logger);
+
+        Assert.Equal(new PollSummary(2, 1, 0, 0, 1), await first.PollOnceAsync(CancellationToken.None));
+        Assert.Equal(new PollSummary(2, 2, 0, 0, 0), await second.PollOnceAsync(CancellationToken.None));
+        Assert.Equal(new PollSummary(2, 0, 2, 0, 0), await second.PollOnceAsync(CancellationToken.None));
+
+        var events = _queues.InvoicesReceived.Where(message => message.InternetMessageId == messageId).ToArray();
+        Assert.Equal(2, events.Length);
+        Assert.NotEqual(events[0].MessageKey, events[1].MessageKey);
+        Assert.NotEqual(events[0].Manifest, events[1].Manifest);
+        foreach (var message in events)
+        {
+            var manifest = _store.Blobs[BlobPaths.Manifest(message.MessageKey)].Content.ToObjectFromJson<InvoiceManifest>(AdapterJson.Options)!;
+            Assert.Equal(message.Mailbox, manifest.Mailbox);
+            Assert.Contains(message.MessageKey, _store.Announced);
+        }
+        Assert.Equal(1, _mailbox.GetMessageCalls);
+        Assert.Equal(2, otherMailbox.GetMessageCalls);
+    }
+
+    [Fact]
     public async Task After_a_restart_the_checkpoint_in_storage_prevents_a_second_capture()
     {
         _mailbox.AddEmail("<inv-1001@example.test>");

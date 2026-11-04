@@ -2,7 +2,6 @@ using ExchangeIntegration.Adapter;
 using ExchangeIntegration.Configuration;
 using ExchangeIntegration.Exchange;
 using ExchangeIntegration.Tests.TestSupport;
-using Microsoft.Extensions.Options;
 
 namespace ExchangeIntegration.Tests;
 
@@ -17,11 +16,10 @@ public class ExchangeCommandHandlerTests
     private readonly InMemoryInvoiceStore _store = new();
     private readonly RecordingEngineQueues _queues = new();
 
-    private ExchangeCommandHandler Create() => new(
-        _mailbox,
+    private ExchangeCommandHandler Create(params ConfiguredMailbox[] others) => new(
+        [new ConfiguredMailbox(new ExchangeOptions { Mailbox = Mailbox, MoveFolders = ["Processed", "Rejected"] }, _mailbox), .. others],
         _store,
         _queues,
-        Options.Create(new ExchangeOptions { Mailbox = Mailbox, MoveFolders = ["Processed", "Rejected"] }),
         new FixedTimeProvider(Now),
         new CapturingLogger<ExchangeCommandHandler>());
 
@@ -180,13 +178,13 @@ public class ExchangeCommandHandlerTests
     public static TheoryData<string, ExchangeCommand> InvalidCommands() => new()
     {
         { "Unknown command type", new ExchangeCommand { Type = "exchange.command.delete", CommandId = $"{Key}.x", MessageKey = Key, InternetMessageId = MessageId, Mailbox = Mailbox } },
-        { "different mailbox", WithMailbox(Reply(), "someone-else@contoso.com") },
+        { "not configured", WithMailbox(Reply(), "someone-else@contoso.com") },
         { "internetMessageId is required", new ExchangeCommand { Type = MessageTypes.Reply, CommandId = $"{Key}.reply", MessageKey = Key, Mailbox = Mailbox, Reply = new ReplyDetails { BodyText = "x" } } },
         { "messageKey does not match", new ExchangeCommand { Type = MessageTypes.Reply, CommandId = $"{Key}.reply", MessageKey = Key, InternetMessageId = "<other@example.test>", Mailbox = Mailbox, Reply = new ReplyDetails { BodyText = "x" } } },
         { "commandId must start with the messageKey", new ExchangeCommand { Type = MessageTypes.Reply, CommandId = $"{new string('0', 32)}.reply", MessageKey = Key, InternetMessageId = MessageId, Mailbox = Mailbox, Reply = new ReplyDetails { BodyText = "x" } } },
         { "reply.bodyText is required", Reply("   ") },
         { "longer than", Reply(new string('a', ExchangeCommandHandler.MaxReplyLength + 1)) },
-        { "not in Exchange:MoveFolders", Move("Deleted Items") },
+        { "not in the target mailbox's MoveFolders", Move("Deleted Items") },
     };
 
     private static ExchangeCommand WithMailbox(ExchangeCommand command, string mailbox) => new()
@@ -240,6 +238,95 @@ public class ExchangeCommandHandlerTests
         await Handle(WithMailbox(Reply(), "AP-Invoices@Contoso.com"));
 
         Assert.Single(_mailbox.SentReplies);
+    }
+
+    private static ExchangeCommand ForMailbox(string mailbox, string type, string folder = "Reviewed", string? keyOverride = null)
+    {
+        var key = keyOverride ?? MessageKeys.Compute(mailbox, MessageId);
+        return new ExchangeCommand
+        {
+            Type = type,
+            CommandId = $"{key}.action",
+            MessageKey = key,
+            InternetMessageId = MessageId,
+            Mailbox = mailbox,
+            Reply = new ReplyDetails { BodyText = "Thanks." },
+            Move = new MoveDetails { Folder = folder },
+        };
+    }
+
+    [Theory]
+    [InlineData(MessageTypes.Move)]
+    [InlineData(MessageTypes.Reply)]
+    public async Task Commands_route_to_the_selected_mailbox_only_and_keep_separate_records(string type)
+    {
+        const string otherAddress = "invoices-other@contoso.com";
+        var other = new FakeMailbox();
+        _mailbox.AddEmail(MessageId);
+        other.AddEmail(MessageId);
+        var handler = Create(new ConfiguredMailbox(new ExchangeOptions { Mailbox = otherAddress, MoveFolders = ["Reviewed"] }, other));
+        var commands = new[]
+        {
+            ForMailbox(" INVOICES-OTHER@CONTOSO.COM ", type),
+            ForMailbox(Mailbox, type, "Processed"),
+        };
+
+        var first = await handler.HandleAsync(BinaryData.FromObjectAsJson(commands[0], AdapterJson.Options), CancellationToken.None);
+        Assert.Equal(CommandResultMessage.Succeeded, first.Result!.Status);
+        Assert.Empty(_mailbox.Moves);
+        Assert.Empty(_mailbox.SentReplies);
+        await handler.HandleAsync(BinaryData.FromObjectAsJson(commands[1], AdapterJson.Options), CancellationToken.None);
+        await handler.HandleAsync(BinaryData.FromObjectAsJson(commands[0], AdapterJson.Options), CancellationToken.None);
+
+        Assert.Equal(2, _store.Blobs.Count);
+        Assert.All(_queues.Results, result => Assert.Equal(CommandResultMessage.Succeeded, result.Status));
+        if (type == MessageTypes.Move)
+        {
+            Assert.Equal("Reviewed", Assert.Single(other.Moves).Folder);
+            Assert.Equal("Processed", Assert.Single(_mailbox.Moves).Folder);
+        }
+        else
+        {
+            Assert.Single(other.SentReplies);
+            Assert.Single(_mailbox.SentReplies);
+        }
+    }
+
+    [Theory]
+    [InlineData(false, "Processed", "MoveFolders")]
+    [InlineData(true, "Reviewed", "messageKey does not match")]
+    public async Task A_command_cannot_borrow_another_mailbox_key_or_allow_list(bool wrongKey, string folder, string reason)
+    {
+        const string otherAddress = "invoices-other@contoso.com";
+        var other = new FakeMailbox();
+        other.AddEmail(MessageId);
+        _mailbox.AddEmail(MessageId);
+        var handler = Create(new ConfiguredMailbox(new ExchangeOptions { Mailbox = otherAddress, MoveFolders = ["Reviewed"] }, other));
+        var command = ForMailbox(otherAddress, MessageTypes.Move, folder, wrongKey ? Key : null);
+
+        var outcome = await handler.HandleAsync(BinaryData.FromObjectAsJson(command, AdapterJson.Options), CancellationToken.None);
+
+        Assert.Equal(CommandResultMessage.Failed, outcome.Result!.Status);
+        Assert.False(outcome.Result.Retryable);
+        Assert.Contains(reason, outcome.Result.Reason);
+        Assert.Empty(other.Moves);
+        Assert.Empty(_mailbox.Moves);
+        Assert.Empty(_store.Blobs);
+    }
+
+    [Fact]
+    public async Task A_reply_to_another_monitored_mailbox_is_refused_to_prevent_loops()
+    {
+        const string otherAddress = "invoices-other@contoso.com";
+        _mailbox.AddEmail(MessageId, from: otherAddress.ToUpperInvariant());
+        var handler = Create(new ConfiguredMailbox(new ExchangeOptions { Mailbox = otherAddress }, new FakeMailbox()));
+
+        var outcome = await handler.HandleAsync(BinaryData.FromObjectAsJson(Reply(), AdapterJson.Options), CancellationToken.None);
+
+        Assert.Equal(CommandResultMessage.Failed, outcome.Result!.Status);
+        Assert.Contains("mail loop", outcome.Result.Reason);
+        Assert.Empty(_mailbox.SentReplies);
+        Assert.Empty(_store.Blobs);
     }
 
     [Theory]

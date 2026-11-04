@@ -113,7 +113,7 @@ public class ServiceRegistrationTests
 
         Assert.Contains(workers, worker => worker is IngestionWorker);
         Assert.Contains(workers, worker => worker is CommandWorker);
-        Assert.IsType<EwsMailbox>(provider.GetRequiredService<IExchangeMailbox>());
+        Assert.IsType<EwsMailbox>(Assert.Single(provider.GetServices<ConfiguredMailbox>()).Client);
         Assert.IsType<BlobInvoiceStore>(provider.GetRequiredService<IInvoiceStore>());
         Assert.IsType<ServiceBusEngineQueues>(provider.GetRequiredService<IEngineQueues>());
         Assert.Equal("invoice-intake", provider.GetRequiredService<BlobContainerClient>().Name);
@@ -144,12 +144,46 @@ public class ServiceRegistrationTests
     }
 
     [Fact]
+    public void Probe_mode_ignores_invalid_service_mailbox_entries()
+    {
+        using var provider = BuildProvider(new(ValidServiceSettings)
+        {
+            ["Exchange:Mailboxes:0:Mailbox"] = "not an address",
+            ["Exchange:Mailboxes:0:TimeoutSeconds"] = "not a number",
+        });
+
+        Assert.Equal("ap-invoices@contoso.com", provider.GetRequiredService<IOptions<ExchangeOptions>>().Value.Mailbox);
+        Assert.NotNull(provider.GetRequiredService<ExchangeConnectivityProbe>());
+        Assert.Empty(provider.GetServices<IHostedService>());
+    }
+
+    [Fact]
+    public void Indexed_environment_variables_and_arguments_configure_multiple_mailboxes()
+    {
+        using var environment = new EnvironmentVariableScope(new Dictionary<string, string?>(NoExchangeVariables)
+        {
+            ["Exchange__Mailboxes__0__Mailbox"] = "first@example.test",
+            ["Exchange__Mailboxes__0__EwsUrl"] = "https://first.example.test/EWS/Exchange.asmx",
+            ["Exchange__Mailboxes__1__Mailbox"] = "second@example.test",
+            ["Exchange__Mailboxes__1__EwsUrl"] = "https://second.example.test/EWS/Exchange.asmx",
+            ["Exchange__Mailboxes__1__PollIntervalSeconds"] = "120",
+        });
+        using var host = BuildHost(serviceMode: true, "--Exchange:Mailboxes:1:PollIntervalSeconds=30");
+
+        var mailboxes = host.Services.GetRequiredService<IOptions<ExchangeMailboxesOptions>>().Value.Mailboxes;
+
+        Assert.Equal(["first@example.test", "second@example.test"], mailboxes.Select(mailbox => mailbox.Mailbox));
+        Assert.Equal(60, mailboxes[0].PollIntervalSeconds);
+        Assert.Equal(30, mailboxes[1].PollIntervalSeconds);
+    }
+
+    [Fact]
     public void The_shipped_appsettings_json_binds_to_valid_service_mode_options()
     {
         using var environment = new EnvironmentVariableScope(NoExchangeVariables);
         using var host = BuildHost(serviceMode: true);
 
-        var exchange = host.Services.GetRequiredService<IOptions<ExchangeOptions>>().Value;
+        var exchange = Assert.Single(host.Services.GetRequiredService<IOptions<ExchangeMailboxesOptions>>().Value.Mailboxes);
         var azure = host.Services.GetRequiredService<IOptions<AzureOptions>>().Value;
 
         Assert.Empty(AzureOptionsValidator.GetFailures(azure));

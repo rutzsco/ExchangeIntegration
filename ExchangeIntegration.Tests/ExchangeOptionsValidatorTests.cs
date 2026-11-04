@@ -145,7 +145,7 @@ public class ExchangeOptionsValidatorTests
 
         Assert.Single(ExchangeOptionsValidator.GetServiceModeFailures(options));
         Assert.Empty(ExchangeOptionsValidator.GetFailures(options));
-        Assert.False(new ServiceModeExchangeOptionsValidator().Validate(null, options).Succeeded);
+        Assert.False(new ExchangeMailboxesOptionsValidator().Validate(null, new() { Mailboxes = [options] }).Succeeded);
     }
 
     [Theory]

@@ -1,8 +1,6 @@
 using System.Text.Json;
-using ExchangeIntegration.Configuration;
 using ExchangeIntegration.Exchange;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
 
 namespace ExchangeIntegration.Adapter;
 
@@ -14,32 +12,29 @@ public sealed record CommandOutcome(CommandResultMessage? Result, string? DeadLe
 
 /// <summary>
 /// Carries out one Engine command (reply or move) and publishes its result. Every command is checked against the
-/// configured mailbox and allow-list first, because the queue is a trust boundary. Exceptions from Blob Storage or
-/// Service Bus propagate so the message is abandoned and redelivered.
+/// configured mailboxes and the target's allow-list first, because the queue is a trust boundary. Exceptions from
+/// Blob Storage or Service Bus propagate so the message is abandoned and redelivered.
 /// </summary>
 public sealed class ExchangeCommandHandler
 {
     public const int MaxReplyLength = 20_000;
 
-    private readonly IExchangeMailbox _mailbox;
+    private readonly IReadOnlyDictionary<string, ConfiguredMailbox> _mailboxes;
     private readonly IInvoiceStore _store;
     private readonly IEngineQueues _queues;
-    private readonly ExchangeOptions _options;
     private readonly TimeProvider _time;
     private readonly ILogger<ExchangeCommandHandler> _logger;
 
     public ExchangeCommandHandler(
-        IExchangeMailbox mailbox,
+        IEnumerable<ConfiguredMailbox> mailboxes,
         IInvoiceStore store,
         IEngineQueues queues,
-        IOptions<ExchangeOptions> options,
         TimeProvider time,
         ILogger<ExchangeCommandHandler> logger)
     {
-        _mailbox = mailbox;
+        _mailboxes = mailboxes.ToDictionary(mailbox => mailbox.Options.Mailbox, StringComparer.OrdinalIgnoreCase);
         _store = store;
         _queues = queues;
-        _options = options.Value;
         _time = time;
         _logger = logger;
     }
@@ -78,7 +73,12 @@ public sealed class ExchangeCommandHandler
 
     private async Task<CommandResultMessage> ExecuteAsync(ExchangeCommand command, string commandId, CancellationToken cancellationToken)
     {
-        var invalid = Validate(command, commandId, out var messageKey, out var folder);
+        if (!_mailboxes.TryGetValue(command.Mailbox?.Trim() ?? string.Empty, out var mailbox))
+        {
+            return Failed(commandId, commandId[..32], "The command mailbox is not configured in this adapter.", retryable: false);
+        }
+
+        var invalid = Validate(command, commandId, mailbox, out var messageKey, out var folder);
         if (invalid is not null)
         {
             return Failed(commandId, messageKey, invalid, retryable: false);
@@ -103,7 +103,7 @@ public sealed class ExchangeCommandHandler
         CommandResultMessage result;
         try
         {
-            var itemIds = await _mailbox.FindInboxItemIdsAsync(command.InternetMessageId!, cancellationToken);
+            var itemIds = await mailbox.Client.FindInboxItemIdsAsync(command.InternetMessageId!, cancellationToken);
             if (itemIds.Count == 0)
             {
                 return Failed(commandId, messageKey, "The email is not in the Inbox (already moved or deleted).", retryable: false);
@@ -119,11 +119,11 @@ public sealed class ExchangeCommandHandler
 
             if (command.Type == MessageTypes.Move)
             {
-                await _mailbox.MoveAsync([itemIds[0]], folder!, cancellationToken);
+                await mailbox.Client.MoveAsync([itemIds[0]], folder!, cancellationToken);
             }
             else
             {
-                var refusal = await ReplyAsync(command, itemIds[0], recordBlob, cancellationToken);
+                var refusal = await ReplyAsync(mailbox, command, itemIds[0], recordBlob, cancellationToken);
                 if (refusal is not null)
                 {
                     return Failed(commandId, messageKey, refusal, retryable: false);
@@ -148,18 +148,18 @@ public sealed class ExchangeCommandHandler
     }
 
     /// <summary>Sends the reply. Returns a refusal reason, or null once sent.</summary>
-    private async Task<string?> ReplyAsync(ExchangeCommand command, string itemId, string recordBlob, CancellationToken cancellationToken)
+    private async Task<string?> ReplyAsync(ConfiguredMailbox mailbox, ExchangeCommand command, string itemId, string recordBlob, CancellationToken cancellationToken)
     {
-        var original = await _mailbox.GetMessageAsync(itemId, cancellationToken);
+        var original = await mailbox.Client.GetMessageAsync(itemId, cancellationToken);
 
         if (original.From is null || string.IsNullOrWhiteSpace(original.From.Address))
         {
             return "The email has no sender address to reply to.";
         }
 
-        if (string.Equals(original.From.Address.Trim(), _options.Mailbox.Trim(), StringComparison.OrdinalIgnoreCase))
+        if (_mailboxes.ContainsKey(original.From.Address.Trim()))
         {
-            return "The email was sent by the monitored mailbox itself; replying would start a loop.";
+            return "The email was sent by a monitored mailbox; replying would risk a mail loop.";
         }
 
         if (original.AutoSubmitted is { } autoSubmitted && !string.Equals(autoSubmitted, "no", StringComparison.OrdinalIgnoreCase))
@@ -171,7 +171,7 @@ public sealed class ExchangeCommandHandler
         await WriteRecordAsync(recordBlob, new CommandRecord { Status = CommandRecord.Started, UpdatedUtc = _time.GetUtcNow() }, cancellationToken);
         try
         {
-            await _mailbox.SendReplyAsync(original, command.Reply!.BodyText!, CancellationToken.None);
+            await mailbox.Client.SendReplyAsync(original, command.Reply!.BodyText!, CancellationToken.None);
         }
         catch (EwsOperationException exception) when (exception.MayHaveTakenEffect)
         {
@@ -186,7 +186,7 @@ public sealed class ExchangeCommandHandler
         return null;
     }
 
-    private string? Validate(ExchangeCommand command, string commandId, out string? messageKey, out string? folder)
+    private static string? Validate(ExchangeCommand command, string commandId, ConfiguredMailbox mailbox, out string? messageKey, out string? folder)
     {
         // The well-formed commandId starts with a 32-hex key; echo that rather than an arbitrary messageKey string.
         messageKey = commandId[..32];
@@ -197,17 +197,12 @@ public sealed class ExchangeCommandHandler
             return $"Unknown command type '{Truncate(command.Type)}'.";
         }
 
-        if (!string.Equals(command.Mailbox?.Trim(), _options.Mailbox.Trim(), StringComparison.OrdinalIgnoreCase))
-        {
-            return "The command is for a different mailbox than the one this adapter serves.";
-        }
-
         if (string.IsNullOrWhiteSpace(command.InternetMessageId))
         {
             return "internetMessageId is required.";
         }
 
-        var expectedKey = MessageKeys.Compute(_options.Mailbox, command.InternetMessageId);
+        var expectedKey = MessageKeys.Compute(mailbox.Options.Mailbox, command.InternetMessageId);
         if (!string.Equals(command.MessageKey, expectedKey, StringComparison.Ordinal))
         {
             return "messageKey does not match the mailbox and internetMessageId.";
@@ -235,8 +230,8 @@ public sealed class ExchangeCommandHandler
         }
 
         var requested = command.Move?.Folder?.Trim();
-        folder = _options.GetMoveFolders().FirstOrDefault(allowed => string.Equals(allowed, requested, StringComparison.OrdinalIgnoreCase));
-        return folder is null ? $"move.folder '{Truncate(requested)}' is not in Exchange:MoveFolders." : null;
+        folder = mailbox.Options.GetMoveFolders().FirstOrDefault(allowed => string.Equals(allowed, requested, StringComparison.OrdinalIgnoreCase));
+        return folder is null ? $"move.folder '{Truncate(requested)}' is not in the target mailbox's MoveFolders." : null;
     }
 
     private async Task<CommandRecord?> ReadRecordAsync(string blobName, CancellationToken cancellationToken)

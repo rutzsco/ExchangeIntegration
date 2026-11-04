@@ -1,6 +1,6 @@
 # Exchange Integration Service
 
-A small .NET 10 Windows application that connects one mailbox on an **on-premises Exchange Server Subscription Edition
+A small .NET 10 Windows application that connects one or more mailboxes on **on-premises Exchange Server Subscription Edition
 (SE)** to an AI Workflow Engine in Azure. It talks to Exchange Web Services (EWS) with **Windows Integrated
 Authentication** and to Azure with Entra ID. One executable has two modes:
 
@@ -42,7 +42,7 @@ The design is in [docs/exchange-adapter-engine-integration-design-short.html](do
 - **EWS enabled for that identity**: not switched off or blocked by an EWS access policy or throttling policy.
 - **Mailbox permissions**:
   - Test mode: the identity must be allowed to see the target mailbox's Inbox.
-  - Service mode: the identity also needs Full Access and Send As.
+  - Service mode: the identity also needs Full Access and Send As on **every** configured mailbox.
 
   See the [Exchange administrator checklist](#exchange-administrator-checklist).
 - **Service mode only:**
@@ -66,7 +66,8 @@ Settings come from `appsettings.json` and can be overridden without code changes
     "TimeoutSeconds": 30,
     "PollIntervalSeconds": 60,
     "MaxMessagesPerPoll": 20,
-    "MoveFolders": [ "Processed" ]
+    "MoveFolders": [ "Processed" ],
+    "Mailboxes": []
   },
   "Azure": {
     "BlobServiceUri": "https://contosoinvoices.blob.core.windows.net",
@@ -89,6 +90,7 @@ Settings come from `appsettings.json` and can be overridden without code changes
 | `Exchange:PollIntervalSeconds` | `Exchange__PollIntervalSeconds` | `60` | Service mode. 5 to 3600; the wait between Inbox polls |
 | `Exchange:MaxMessagesPerPoll` | `Exchange__MaxMessagesPerPoll` | `20` | Service mode. 1 to 500; new emails captured per poll, oldest first. The rest wait for the next poll |
 | `Exchange:MoveFolders` | `Exchange__MoveFolders__0`, `__1`, ... | `["Processed"]` | Service mode. The only folders a `move` command may name. These are display names of **top-level** folders (siblings of the Inbox) that already exist; paths are rejected |
+| `Exchange:Mailboxes` | `Exchange__Mailboxes__0__Mailbox`, `Exchange__Mailboxes__0__EwsUrl`, ... | `[]` | Service mode. Optional list of independent Exchange configurations; a non-empty list replaces the single-mailbox settings above. See [Multiple mailboxes](#multiple-mailboxes) |
 | `Azure:BlobServiceUri` | `Azure__BlobServiceUri` | none, required in service mode | `https://<account>.blob.core.windows.net`, with no SAS token |
 | `Azure:IntakeContainer` | `Azure__IntakeContainer` | `invoice-intake` | Existing container |
 | `Azure:ServiceBusNamespace` | `Azure__ServiceBusNamespace` | none, required in service mode | Host name such as `<namespace>.servicebus.windows.net`, not a connection string |
@@ -98,7 +100,7 @@ Settings come from `appsettings.json` and can be overridden without code changes
 | `Azure:UseWebSockets` | `Azure__UseWebSockets` | `false` | `true` sends Service Bus traffic as AMQP over WebSockets on TCP 443 instead of AMQP on TCP 5671 |
 | `Logging:LogLevel:Default` | `Logging__LogLevel__Default` | `Information` | Use `Debug` for more detail |
 
-Test mode ignores the `Azure` section and the service-mode `Exchange` settings.
+Test mode ignores the `Azure` section, `Exchange:Mailboxes` and the service-mode `Exchange` settings.
 
 The values shipped in `appsettings.json` are **placeholders** (`contoso.com`, `contosoinvoices`). Replace them with
 environment variables or a local override file. `appsettings.*.json` files other than `appsettings.json` are git-ignored,
@@ -110,6 +112,60 @@ All problems are reported at once, before anything is sent to Exchange or Azure,
 Configuration errors (nothing was sent to Exchange):
   - Exchange:EwsUrl must use HTTPS (found 'http'); Windows authentication must not run over an unencrypted channel.
   - Exchange:Mailbox must be a plain SMTP address such as ap-invoices@contoso.com (no display name or surrounding spaces).
+```
+
+### Multiple mailboxes
+
+For service mode, put any number of entries in `Exchange:Mailboxes`. There is no fixed mailbox-count limit.
+Each entry requires its own `Mailbox` and `EwsUrl` and accepts the same settings as the single-mailbox configuration:
+`AccessMode`, `TimeoutSeconds`, `PollIntervalSeconds`, `MaxMessagesPerPoll` and `MoveFolders`.
+Omitted optional settings use their built-in defaults; entries **do not inherit** the outer `Exchange` values.
+The existing `Azure` section is shared and unchanged.
+
+```json
+{
+  "Exchange": {
+    "Mailboxes": [
+      {
+        "Mailbox": "ap-invoices@contoso.com",
+        "EwsUrl": "https://mail.contoso.com/EWS/Exchange.asmx",
+        "PollIntervalSeconds": 60,
+        "MaxMessagesPerPoll": 20,
+        "MoveFolders": [ "Processed" ]
+      },
+      {
+        "Mailbox": "ap-invoices-eu@contoso.com",
+        "EwsUrl": "https://mail-eu.contoso.com/EWS/Exchange.asmx",
+        "TimeoutSeconds": 45,
+        "PollIntervalSeconds": 120,
+        "MaxMessagesPerPoll": 10,
+        "MoveFolders": [ "Processed", "Review" ]
+      }
+    ]
+  }
+}
+```
+
+Add entries at indices `2`, `3`, etc. without code changes. Environment variables and command-line overrides use the
+same zero-based indices, for example `Exchange__Mailboxes__1__PollIntervalSeconds=90` or
+`--Exchange:Mailboxes:1:PollIntervalSeconds=90`. Configuration sources merge by index; when removing an entry, remove
+its keys from every source (including environment variables). Restart the service after configuration changes.
+
+- If the list is absent or empty, service mode uses the original single `Exchange:Mailbox` configuration.
+- All entries are validated before workers start. SMTP addresses must be unique, case-insensitively, even across
+  different EWS endpoints, because commands route by address.
+- Each mailbox has its own poller, timeout, capture limit, checkpoint cache and folder cache. Polls do not overlap
+  within a mailbox; a slow or failed poll does not hold up the other mailboxes. Host, memory and Exchange throttling
+  still impose practical capacity limits.
+- All entries use the **same Windows process identity** and the **same Azure container and queues**. Commands are
+  processed one at a time across all mailboxes. Unknown mailbox addresses receive a non-retryable failed result.
+- Message keys already include the mailbox address, so the same Message-ID in two mailboxes has separate blobs,
+  announcements and command records. The Engine message format does not change.
+
+The read-only `--probe` remains a single-mailbox test. Probe each entry explicitly under the intended identity:
+
+```powershell
+dotnet run -- --probe --Exchange:Mailbox=ap-invoices-eu@contoso.com --Exchange:EwsUrl=https://mail-eu.contoso.com/EWS/Exchange.asmx --Exchange:TimeoutSeconds=45
 ```
 
 ## Running locally
@@ -272,7 +328,7 @@ Service mode runs two independent loops until it is stopped.
 
 ```mermaid
 flowchart LR
-    Inbox[(Exchange Inbox)] -- "1 poll (EWS)" --> Adapter[Exchange Adapter --run]
+    Inbox[(Exchange Inboxes)] -- "1 poll per mailbox (EWS)" --> Adapter[Exchange Adapter --run]
     Adapter -- "2 attachments + manifest.json" --> Blob[(Blob: invoice-intake)]
     Adapter -- "3 invoice.received" --> Q1[[invoice-received]]
     Q1 --> Engine[AI Workflow Engine]
@@ -283,7 +339,7 @@ flowchart LR
     Q3 --> Engine
 ```
 
-**Ingestion (Exchange → Azure)**, every `PollIntervalSeconds`:
+**Ingestion (Exchange → Azure)**, independently for each mailbox, waiting its `PollIntervalSeconds` after each poll:
 
 1. **List the Inbox.** The adapter lists the Inbox oldest first: up to 50 pages of 200, plus each email's Message-ID.
    - Only emails (`IPM.Note*`) are considered.
@@ -311,10 +367,10 @@ flowchart LR
    because no result could be correlated with it.
 2. **Validate.** Every other command gets exactly one `exchange.command.result`. The checks are:
    - `type` is `exchange.command.reply` or `exchange.command.move`.
-   - `mailbox` is the configured mailbox.
+   - `mailbox` selects a configured mailbox (case-insensitive). An unknown address is rejected, never routed to a default.
    - `messageKey` matches the mailbox and `internetMessageId`.
    - `commandId` is `<messageKey>.<suffix>`.
-   - For a move, the folder is in `Exchange:MoveFolders`.
+   - For a move, the folder is in that mailbox's `MoveFolders`.
    - For a reply, the text is non-empty and at most 20,000 characters.
 3. **Find the email.** The email is looked up in the Inbox by Message-ID. If it is not there, the result is `failed`
    ("already moved or deleted").
@@ -323,8 +379,8 @@ flowchart LR
 5. **Reply.** The reply is a **new** plain-text email sent as the mailbox. It goes **only to the original From
    address**; a `Reply-To` header is ignored because email content is untrusted. It has an `RE:` subject and
    `In-Reply-To`/`References` headers, and a copy is saved in Sent Items.
-   - It is refused when the email came from the mailbox itself or carries an `Auto-Submitted` header other than `no`
-     (loop guards).
+   - It is refused when the email came from **any monitored mailbox** or carries an `Auto-Submitted` header other than
+     `no` (loop guards, including loops between monitored mailboxes).
 6. **Record the outcome.** A command record at `<messageKey>/commands/<commandId>.json` makes repeats safe:
    - A command that already succeeded just republishes its stored result.
    - A reply is sent **at most once**. A `started` record is written before sending and stays if the outcome is unknown
@@ -453,8 +509,10 @@ to the executable. Start the service.
 - To watch it work, stop the service and run `ExchangeIntegration.exe --run` in a console as the same identity. Logs
   then go to stderr.
 
-Run **one** adapter per mailbox. Two instances would capture the same emails twice (harmless, because of duplicate
-detection) and would split commands between them.
+Run **one adapter instance for all mailboxes sharing a command queue**. Do not monitor a mailbox from two instances:
+reply records are not a distributed lock. Do not share a command queue between adapters with different mailbox lists:
+Service Bus distributes messages between consumers, so a command could reach an adapter that does not own its mailbox
+and be rejected. Separate deployments need separate command queues and Engine-side routing.
 
 ### Not yet verified
 
@@ -468,6 +526,8 @@ against the customer's Exchange with a test mailbox before production:
 - `GetItem` returns `item:InternetMessageHeaders`, which the `Auto-Submitted` loop guard needs.
 - `FindFolder` under `msgfolderroot` finds the `MoveFolders` by display name.
 - `DefaultAzureCredential` obtains tokens through Azure Arc under the service account.
+- Multiple mailboxes work under that identity, including distinct EWS endpoints, folder permissions and Exchange
+  throttling under the combined load.
 
 ## Kerberos versus NTLM
 
@@ -688,18 +748,19 @@ The same check exists as a live test: set `EXCHANGE_LIVE_TESTS=1` and
   call so scope can be decided per mailbox.
 - **Two modes, one composition root:** `Program.cs` requires exactly one of `--probe` or `--run`.
   - `AddExchangeIntegration` registers the probe.
-  - `AddExchangeAdapter` adds the Azure clients, `AddWindowsService()` and the two `BackgroundService` workers,
-    `IngestionWorker` and `CommandWorker`.
+  - `AddExchangeAdapter` registers shared Azure clients, one `IngestionWorker` per mailbox and one `CommandWorker`.
+    `Program.cs` enables the Windows service lifetime with `AddWindowsService()`.
   - Configuration is resolved relative to the application directory, which a service needs because its working
     directory is `System32`.
 - **Service mode stays small on purpose:**
   - There is no database and no local state; the blob manifest and command records are the checkpoints.
   - Commands run one at a time.
   - The Inbox is re-listed on every poll, so the Engine must keep it short by moving handled emails.
-  - Service mode uses its own `HttpClient`, with the same Windows authentication, no redirects and TLS rules, and a 128 MB
-    response limit for attachments.
+  - Service mode uses a long-lived `HttpClient` per mailbox, with the same Windows authentication, no redirects and TLS
+    rules, and a 128 MB response limit per request for attachments. The host disposes all clients at shutdown.
 - **Untrusted email:** nothing in an email chooses a recipient, folder or command. The reply recipient is the From
-  address, folders come from configuration, and logs contain only message keys, never addresses, subjects or file names.
+  address, folders come from configuration, and logs contain message keys and configured mailbox context, never sender
+  addresses, subjects or file names.
 
 ## Project layout
 
@@ -709,11 +770,11 @@ global.json
 ExchangeIntegration.csproj
 Program.cs                      Host composition root: --probe (test mode) and --run (service mode)
 appsettings.json                Placeholder settings
-Configuration/                  ExchangeOptions, AzureOptions, startup validation, service registration
+Configuration/                  ExchangeOptions, ExchangeMailboxesOptions, AzureOptions, startup validation, service registration
 Authentication/                 ExchangeHttpClientFactory (Windows authentication), process identity
 Exchange/                       IEwsClient/EwsClient (probe), IExchangeMailbox/EwsMailbox (service), SOAP builder and parser, failure categories, redaction
 Diagnostics/                    ExchangeConnectivityProbe, ConnectivityResult, console report
-Adapter/                        Service mode: JSON contracts, message keys, ingestion, command handling, the two workers
+Adapter/                        Service mode: JSON contracts, configured mailboxes, message keys, ingestion, command routing, workers
 Cloud/                          Blob Storage and Service Bus implementations of the adapter's ports
 docs/                           Design document
 ExchangeIntegration.Tests/      xUnit tests (mocked HTTP transport, loopback server, in-memory fakes, opt-in live tests)

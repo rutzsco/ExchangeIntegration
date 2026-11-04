@@ -111,13 +111,3 @@ public sealed class ExchangeOptionsValidator : IValidateOptions<ExchangeOptions>
         }
     }
 }
-
-/// <summary>Validates the service-mode-only <see cref="ExchangeOptions"/> settings; registered only by AddExchangeAdapter.</summary>
-public sealed class ServiceModeExchangeOptionsValidator : IValidateOptions<ExchangeOptions>
-{
-    public ValidateOptionsResult Validate(string? name, ExchangeOptions options)
-    {
-        var failures = ExchangeOptionsValidator.GetServiceModeFailures(options);
-        return failures.Count == 0 ? ValidateOptionsResult.Success : ValidateOptionsResult.Fail(failures);
-    }
-}

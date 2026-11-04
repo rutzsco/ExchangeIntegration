@@ -10,6 +10,7 @@ public sealed class IngestionWorker : BackgroundService
 {
     private readonly InvoiceIngestion _ingestion;
     private readonly TimeSpan _interval;
+    private readonly string _mailbox;
     private readonly TimeProvider _time;
     private readonly ILogger<IngestionWorker> _logger;
 
@@ -17,12 +18,14 @@ public sealed class IngestionWorker : BackgroundService
     {
         _ingestion = ingestion;
         _interval = TimeSpan.FromSeconds(options.Value.PollIntervalSeconds);
+        _mailbox = options.Value.Mailbox;
         _time = time;
         _logger = logger;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        using var scope = _logger.BeginScope("Mailbox {Mailbox}", _mailbox);
         _logger.LogInformation("Inbox polling started; interval {Interval}.", _interval);
 
         while (!stoppingToken.IsCancellationRequested)
@@ -37,7 +40,9 @@ public sealed class IngestionWorker : BackgroundService
             }
             catch (Exception exception)
             {
-                _logger.LogError("Inbox poll failed; retrying in {Interval}: {Error}", _interval, InvoiceIngestion.Describe(exception));
+                _logger.LogError(
+                    "Inbox poll failed for {Mailbox}; retrying in {Interval}: {Error}",
+                    _mailbox, _interval, InvoiceIngestion.Describe(exception));
             }
 
             await Task.Delay(_interval, _time, stoppingToken).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);

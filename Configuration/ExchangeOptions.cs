@@ -10,7 +10,7 @@ public enum ExchangeAccessMode
     Impersonation = 1,
 }
 
-/// <summary>Exchange settings bound from the "Exchange" configuration section.</summary>
+/// <summary>One mailbox's settings, bound from "Exchange" or an entry in "Exchange:Mailboxes".</summary>
 public sealed class ExchangeOptions
 {
     public const string SectionName = "Exchange";
@@ -23,7 +23,7 @@ public sealed class ExchangeOptions
     /// <summary>HTTPS URL of the EWS endpoint, for example https://mail.contoso.com/EWS/Exchange.asmx.</summary>
     public string EwsUrl { get; set; } = string.Empty;
 
-    /// <summary>Primary SMTP address of the mailbox whose Inbox is probed.</summary>
+    /// <summary>Primary SMTP address of the mailbox whose Inbox is probed or monitored.</summary>
     public string Mailbox { get; set; } = string.Empty;
 
     public ExchangeAccessMode AccessMode { get; set; } = ExchangeAccessMode.Delegated;

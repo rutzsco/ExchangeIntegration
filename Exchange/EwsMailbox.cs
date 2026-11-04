@@ -3,7 +3,6 @@ using System.Net;
 using System.Text;
 using System.Xml.Linq;
 using ExchangeIntegration.Configuration;
-using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -15,9 +14,6 @@ namespace ExchangeIntegration.Exchange;
 /// </summary>
 public sealed class EwsMailbox : IExchangeMailbox
 {
-    /// <summary>DI key of the service-mode <see cref="HttpClient"/>, which allows larger responses than the probe's.</summary>
-    public const string HttpClientKey = "ExchangeIntegration.Adapter";
-
     public const int PageSize = 200;
     public const int MaxPages = 50;
 
@@ -41,7 +37,7 @@ public sealed class EwsMailbox : IExchangeMailbox
     private readonly ConcurrentDictionary<string, string> _folderIds = new(StringComparer.OrdinalIgnoreCase);
 
     public EwsMailbox(
-        [FromKeyedServices(HttpClientKey)] HttpClient httpClient,
+        HttpClient httpClient,
         IOptions<ExchangeOptions> options,
         ILogger<EwsMailbox> logger)
     {
