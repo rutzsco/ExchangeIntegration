@@ -30,6 +30,8 @@ secrets.json
 .env
 .env.*
 
+# Local mode (--local) data: sample emails, blobs and queue messages
+local-data/
 # Logs and diagnostics captures
 *.log
 *.etl

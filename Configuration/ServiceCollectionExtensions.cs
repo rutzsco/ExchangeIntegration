@@ -7,6 +7,7 @@ using ExchangeIntegration.Authentication;
 using ExchangeIntegration.Cloud;
 using ExchangeIntegration.Diagnostics;
 using ExchangeIntegration.Exchange;
+using ExchangeIntegration.Local;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -45,7 +46,17 @@ public static class ServiceCollectionExtensions
     /// <summary>
     /// Service mode (--run): one EWS client and poller per mailbox, shared Azure clients and one command listener.
     /// </summary>
-    public static IServiceCollection AddExchangeAdapter(this IServiceCollection services, IConfiguration configuration)
+    public static IServiceCollection AddExchangeAdapter(this IServiceCollection services, IConfiguration configuration) =>
+        AddAdapter(services, configuration, local: false);
+
+    /// <summary>
+    /// Local mode (--local): service mode with folders under Local:RootPath standing in for each mailbox, Blob Storage
+    /// and Service Bus, so it runs without Exchange or Azure.
+    /// </summary>
+    public static IServiceCollection AddLocalExchangeAdapter(this IServiceCollection services, IConfiguration configuration) =>
+        AddAdapter(services, configuration, local: true);
+
+    private static IServiceCollection AddAdapter(IServiceCollection services, IConfiguration configuration, bool local)
     {
         ArgumentNullException.ThrowIfNull(services);
         ArgumentNullException.ThrowIfNull(configuration);
@@ -58,7 +69,7 @@ public static class ServiceCollectionExtensions
             mailboxSections = [exchange];
         }
 
-        services.AddSingleton<IValidateOptions<ExchangeMailboxesOptions>, ExchangeMailboxesOptionsValidator>();
+        services.AddSingleton<IValidateOptions<ExchangeMailboxesOptions>>(new ExchangeMailboxesOptionsValidator(local));
         services.AddOptions<ExchangeMailboxesOptions>()
             .Configure(options =>
             {
@@ -80,52 +91,61 @@ public static class ServiceCollectionExtensions
             })
             .ValidateOnStart();
 
-        services.AddSingleton<IValidateOptions<AzureOptions>, AzureOptionsValidator>();
+        services.AddSingleton<IValidateOptions<AzureOptions>>(new AzureOptionsValidator(local));
         services.AddOptions<AzureOptions>()
             .Bind(configuration.GetSection(AzureOptions.SectionName))
             .ValidateOnStart();
 
         services.TryAddSingleton(TimeProvider.System);
-        services.TryAddSingleton<TokenCredential>(_ => new DefaultAzureCredential());
-
-        services.AddSingleton(provider =>
+        if (local)
         {
-            var azure = provider.GetRequiredService<IOptions<AzureOptions>>().Value;
-            return new BlobServiceClient(new Uri(azure.BlobServiceUri), provider.GetRequiredService<TokenCredential>())
-                .GetBlobContainerClient(azure.IntakeContainer);
-        });
+            services.AddSingleton(new LocalFolders(configuration[LocalFolders.RootPathSetting]));
+            services.AddSingleton<IInvoiceStore>(provider => new FileInvoiceStore(
+                provider.GetRequiredService<LocalFolders>().Container(provider.GetRequiredService<IOptions<AzureOptions>>().Value.IntakeContainer)));
+            services.AddSingleton<IEngineQueues, FileEngineQueues>();
 
-        services.AddSingleton(provider =>
+            // Hosted services start in registration order: the folders must exist before the first poll.
+            services.AddHostedService<LocalDataSetup>();
+        }
+        else
         {
-            var azure = provider.GetRequiredService<IOptions<AzureOptions>>().Value;
-            return new ServiceBusClient(
-                azure.ServiceBusNamespace,
-                provider.GetRequiredService<TokenCredential>(),
-                new ServiceBusClientOptions
-                {
-                    TransportType = azure.UseWebSockets ? ServiceBusTransportType.AmqpWebSockets : ServiceBusTransportType.AmqpTcp,
-                });
-        });
+            AddAzureClients(services);
+        }
 
-        services.AddSingleton<IInvoiceStore, BlobInvoiceStore>();
-        services.AddSingleton<IEngineQueues, ServiceBusEngineQueues>();
         for (var index = 0; index < mailboxSections.Length; index++)
         {
             var mailboxIndex = index;
-            services.AddKeyedSingleton<HttpClient>(mailboxIndex, (provider, _) =>
-                ExchangeHttpClientFactory.CreateForAdapter(
-                    provider.GetRequiredService<IOptions<ExchangeMailboxesOptions>>().Value.Mailboxes[mailboxIndex]));
-
-            services.AddKeyedSingleton<ConfiguredMailbox>(mailboxIndex, (provider, _) =>
+            if (local)
             {
-                var options = provider.GetRequiredService<IOptions<ExchangeMailboxesOptions>>().Value.Mailboxes[mailboxIndex];
-                return new ConfiguredMailbox(
-                    options,
-                    new EwsMailbox(
-                        provider.GetRequiredKeyedService<HttpClient>(mailboxIndex),
-                        Options.Create(options),
-                        provider.GetRequiredService<ILogger<EwsMailbox>>()));
-            });
+                services.AddKeyedSingleton<ConfiguredMailbox>(mailboxIndex, (provider, _) =>
+                {
+                    var options = provider.GetRequiredService<IOptions<ExchangeMailboxesOptions>>().Value.Mailboxes[mailboxIndex];
+                    return new ConfiguredMailbox(
+                        options,
+                        new FolderMailbox(
+                            provider.GetRequiredService<LocalFolders>().Mailbox(options.Mailbox),
+                            options.Mailbox,
+                            provider.GetRequiredService<TimeProvider>()));
+                });
+            }
+            else
+            {
+                services.AddKeyedSingleton<HttpClient>(mailboxIndex, (provider, _) =>
+                    ExchangeHttpClientFactory.CreateForAdapter(
+                        provider.GetRequiredService<IOptions<ExchangeMailboxesOptions>>().Value.Mailboxes[mailboxIndex]));
+
+                services.AddKeyedSingleton<ConfiguredMailbox>(mailboxIndex, (provider, _) =>
+                {
+                    var options = provider.GetRequiredService<IOptions<ExchangeMailboxesOptions>>().Value.Mailboxes[mailboxIndex];
+                    return new ConfiguredMailbox(
+                        options,
+                        new EwsMailbox(
+                            provider.GetRequiredKeyedService<HttpClient>(mailboxIndex),
+                            Options.Create(options),
+                            provider.GetRequiredService<ILogger<EwsMailbox>>()));
+                });
+            }
+
             services.AddSingleton(provider => provider.GetRequiredKeyedService<ConfiguredMailbox>(mailboxIndex));
 
             services.AddKeyedSingleton<InvoiceIngestion>(mailboxIndex, (provider, _) =>
@@ -149,8 +169,42 @@ public static class ServiceCollectionExtensions
         }
 
         services.AddSingleton<ExchangeCommandHandler>();
-        services.AddHostedService<CommandWorker>();
+        if (local)
+        {
+            services.AddHostedService<LocalCommandWorker>();
+        }
+        else
+        {
+            services.AddHostedService<CommandWorker>();
+        }
 
         return services;
+    }
+
+    private static void AddAzureClients(IServiceCollection services)
+    {
+        services.TryAddSingleton<TokenCredential>(_ => new DefaultAzureCredential());
+
+        services.AddSingleton(provider =>
+        {
+            var azure = provider.GetRequiredService<IOptions<AzureOptions>>().Value;
+            return new BlobServiceClient(new Uri(azure.BlobServiceUri), provider.GetRequiredService<TokenCredential>())
+                .GetBlobContainerClient(azure.IntakeContainer);
+        });
+
+        services.AddSingleton(provider =>
+        {
+            var azure = provider.GetRequiredService<IOptions<AzureOptions>>().Value;
+            return new ServiceBusClient(
+                azure.ServiceBusNamespace,
+                provider.GetRequiredService<TokenCredential>(),
+                new ServiceBusClientOptions
+                {
+                    TransportType = azure.UseWebSockets ? ServiceBusTransportType.AmqpWebSockets : ServiceBusTransportType.AmqpTcp,
+                });
+        });
+
+        services.AddSingleton<IInvoiceStore, BlobInvoiceStore>();
+        services.AddSingleton<IEngineQueues, ServiceBusEngineQueues>();
     }
 }

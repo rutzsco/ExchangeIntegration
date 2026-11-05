@@ -31,6 +31,16 @@ public sealed class ExchangeOptionsValidator : IValidateOptions<ExchangeOptions>
         return failures;
     }
 
+    /// <summary>The mailbox address check alone; local mode (--local) has no EWS endpoint or Windows authentication.</summary>
+    public static IReadOnlyList<string> GetMailboxFailures(ExchangeOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+
+        var failures = new List<string>();
+        ValidateMailbox(options.Mailbox, failures);
+        return failures;
+    }
+
     /// <summary>The settings only service mode (--run) uses, so they never stop the read-only probe.</summary>
     public static IReadOnlyList<string> GetServiceModeFailures(ExchangeOptions options)
     {

@@ -2,12 +2,13 @@
 
 A small .NET 10 Windows application that connects one or more mailboxes on **on-premises Exchange Server Subscription Edition
 (SE)** to an AI Workflow Engine in Azure. It talks to Exchange Web Services (EWS) with **Windows Integrated
-Authentication** and to Azure with Entra ID. One executable has two modes:
+Authentication** and to Azure with Entra ID. One executable has two production modes, plus a local mode for development:
 
 | Mode | Command | What it does |
 |---|---|---|
 | **Test** | `--probe` | Sends one read-only SOAP `GetFolder` for the Inbox. This proves the EWS endpoint is reachable over HTTPS, the process identity is accepted and that identity can open the configured mailbox. It prints a report and exits with a code per failure category. It needs no Azure. |
 | **Service** | `--run` | Runs until stopped, normally as a Windows service. It copies each new Inbox email's attachments to **Azure Blob Storage**, announces the email on **Azure Service Bus**, and carries out the Engine's `reply` and `move` commands in Exchange. See [Service mode](#service-mode---run). |
+| **Local** | `--local` | Development only. Service mode with local folders in place of Exchange, Blob Storage and Service Bus: `.eml` files are the Inbox, and blobs and queue messages are files. It needs no mail server and no Azure. See [Run without Exchange or Azure](#run-without-exchange-or-azure---local). |
 
 The design is in [docs/exchange-adapter-engine-integration-design-short.html](docs/exchange-adapter-engine-integration-design-short.html).
 
@@ -98,6 +99,7 @@ Settings come from `appsettings.json` and can be overridden without code changes
 | `Azure:CommandsQueue` | `Azure__CommandsQueue` | `exchange-commands` | Existing queue, Engine → adapter |
 | `Azure:CommandResultsQueue` | `Azure__CommandResultsQueue` | `exchange-command-results` | Existing queue, adapter → Engine |
 | `Azure:UseWebSockets` | `Azure__UseWebSockets` | `false` | `true` sends Service Bus traffic as AMQP over WebSockets on TCP 443 instead of AMQP on TCP 5671 |
+| `Local:RootPath` | `Local__RootPath` | `local-data` | Local mode only. The folder for mailboxes, blobs and queues; a relative path is resolved against the current directory |
 | `Logging:LogLevel:Default` | `Logging__LogLevel__Default` | `Information` | Use `Debug` for more detail |
 
 Test mode ignores the `Azure` section, `Exchange:Mailboxes` and the service-mode `Exchange` settings.
@@ -189,12 +191,61 @@ service account, start the process as that account; see
 A published build runs the same way: `dotnet publish -c Release -o <folder>`, then `<folder>\ExchangeIntegration.exe --probe`.
 
 - `--probe` runs the one-time test and exits. `--run` starts service mode (see [Service mode](#service-mode---run)).
-  `--help` prints usage. Running with neither or both prints usage and exits with 64.
+  `--local` starts local mode (see below). `--help` prints usage. Running with none, or more than one, of `--probe`,
+  `--run` and `--local` prints usage and exits with 64.
 - The report goes to **stdout**; structured logs go to **stderr**. Capture them separately with
   `dotnet run -- --probe 2> probe.log`.
 
 > **Security note.** Windows Integrated Authentication answers any Negotiate or NTLM challenge with the credentials of
 > the process. Point the probe only at the customer's own Exchange host, never at an arbitrary URL.
+
+### Run without Exchange or Azure (`--local`)
+
+Local mode runs the real ingestion and command code of service mode against folders, so you can watch the whole flow on
+a development machine with no mail server, no Azure resources and no Windows authentication:
+
+```powershell
+dotnet run -- --local --Exchange:PollIntervalSeconds=5
+```
+
+On first start it creates this layout under `Local:RootPath` (default `local-data` in the current directory, git-ignored)
+and puts a sample invoice email in each new mailbox's Inbox, which is captured on the first poll:
+
+```text
+local-data/
+  mailboxes/<mailbox address>/
+    Inbox/                 Drop .eml files here; each file is one email
+    Sent Items/            Replies are written here as .eml files
+    Processed/             One folder per Exchange:MoveFolders entry; move commands move .eml files here
+  blobs/invoice-intake/    <messageKey>/manifest.json, attachments/..., commands/... (as in Blob Storage)
+  queues/invoice-received/ One JSON file per invoice.received message, named <messageKey>.json
+  queues/exchange-commands/                Drop Engine command files (*.json) here
+  queues/exchange-command-results/         One JSON file per command result
+```
+
+To act as the Engine, take `messageKey` and `internetMessageId` from a file in `queues/invoice-received` and save a
+command such as this as `queues/exchange-commands/reply.json`:
+
+```json
+{
+  "type": "exchange.command.reply",
+  "commandId": "<messageKey>.reply-1",
+  "messageKey": "<messageKey>",
+  "mailbox": "ap-invoices@contoso.com",
+  "internetMessageId": "<sample-invoice-1001@example.test>",
+  "reply": { "bodyText": "Thank you, your invoice was received." }
+}
+```
+
+A move uses `"type": "exchange.command.move"` and `"move": { "folder": "Processed" }` instead of `reply`. Within two
+seconds the file moves to `processed/` (or to `dead-letter/` if it is rejected, with the reason in the log) and the
+result appears in `queues/exchange-command-results`.
+
+- Only `Exchange:Mailbox` (or each `Exchange:Mailboxes` entry's `Mailbox`), the service-mode settings and the Azure
+  container and queue names (used as folder names) are read. `EwsUrl`, `AccessMode`, `TimeoutSeconds` and the Azure
+  endpoints are ignored.
+- Local mode is for development only. It never contacts Exchange or Azure, and it is not a Windows service.
+- Delete the `local-data` folder to start again with a fresh sample email.
 
 ### Example output on success
 
@@ -265,7 +316,7 @@ Overall: FAILURE (exit code 5)
 | 11 | `UnexpectedRedirect` | The endpoint redirected; redirects are never followed | Configuration / Exchange authentication |
 | 12 | `UnexpectedHttpStatus` | A status that is not an EWS response (404, 5xx, 407, ...) | Exchange service / network |
 | 13 | `EwsError` | EWS returned another error code (kept verbatim in the report) | Exchange service |
-| 64 | - | Usage error: no command, or both `--probe` and `--run` | - |
+| 64 | - | Usage error: no command, or more than one of `--probe`, `--run` and `--local` | - |
 | 130 | `Cancelled` | Cancelled with Ctrl+C | - |
 
 These codes describe test mode. Service mode exits with 0 when stopped, 2 for invalid configuration and 1 for an
@@ -693,7 +744,8 @@ Service mode is tested without Exchange or Azure:
   - the loop guards;
   - dead-lettering.
 
-The JSON contracts and the dependency injection wiring for both modes are covered too.
+The JSON contracts and the dependency injection wiring for both modes are covered too. Local mode is tested end to end:
+the sample email is captured to files and a command file moves it.
 
 ### Optional live integration tests (customer-approved test mailbox)
 
@@ -746,10 +798,12 @@ The same check exists as a live test: set `EXCHANGE_LIVE_TESTS=1` and
 - **Impersonation later:** `ExchangeAccessMode` reserves `Impersonation` (currently rejected), `EwsRequestBuilder` is the
   single place SOAP headers are produced (where `ExchangeImpersonation` will go), and `IEwsClient` takes the mailbox per
   call so scope can be decided per mailbox.
-- **Two modes, one composition root:** `Program.cs` requires exactly one of `--probe` or `--run`.
+- **One composition root:** `Program.cs` requires exactly one of `--probe`, `--run` or `--local`.
   - `AddExchangeIntegration` registers the probe.
   - `AddExchangeAdapter` registers shared Azure clients, one `IngestionWorker` per mailbox and one `CommandWorker`.
     `Program.cs` enables the Windows service lifetime with `AddWindowsService()`.
+  - `AddLocalExchangeAdapter` registers the same ingestion and command handling with the folder implementations in
+    `Local/` (`FolderMailbox`, `FileInvoiceStore`, `FileEngineQueues`, `LocalCommandWorker`) in place of EWS and Azure.
   - Configuration is resolved relative to the application directory, which a service needs because its working
     directory is `System32`.
 - **Service mode stays small on purpose:**
@@ -768,7 +822,7 @@ The same check exists as a live test: set `EXCHANGE_LIVE_TESTS=1` and
 ExchangeIntegration.slnx
 global.json
 ExchangeIntegration.csproj
-Program.cs                      Host composition root: --probe (test mode) and --run (service mode)
+Program.cs                      Host composition root: --probe (test mode), --run (service mode) and --local (local mode)
 appsettings.json                Placeholder settings
 Configuration/                  ExchangeOptions, ExchangeMailboxesOptions, AzureOptions, startup validation, service registration
 Authentication/                 ExchangeHttpClientFactory (Windows authentication), process identity
@@ -776,6 +830,7 @@ Exchange/                       IEwsClient/EwsClient (probe), IExchangeMailbox/E
 Diagnostics/                    ExchangeConnectivityProbe, ConnectivityResult, console report
 Adapter/                        Service mode: JSON contracts, configured mailboxes, message keys, ingestion, command routing, workers
 Cloud/                          Blob Storage and Service Bus implementations of the adapter's ports
+Local/                          Local mode: folder-backed mailbox (.eml files via MimeKit), blob store and queues
 docs/                           Design document
 ExchangeIntegration.Tests/      xUnit tests (mocked HTTP transport, loopback server, in-memory fakes, opt-in live tests)
 ```

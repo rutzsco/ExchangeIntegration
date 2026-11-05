@@ -10,7 +10,8 @@ public sealed class ExchangeMailboxesOptions
     internal string[] ConfigurationPaths { get; set; } = [];
 }
 
-public sealed class ExchangeMailboxesOptionsValidator : IValidateOptions<ExchangeMailboxesOptions>
+/// <param name="localMode">Local mode (--local) needs no EWS settings, and move folders must be valid folder names.</param>
+public sealed class ExchangeMailboxesOptionsValidator(bool localMode = false) : IValidateOptions<ExchangeMailboxesOptions>
 {
     public ValidateOptionsResult Validate(string? name, ExchangeMailboxesOptions options)
     {
@@ -26,7 +27,7 @@ public sealed class ExchangeMailboxesOptionsValidator : IValidateOptions<Exchang
             var mailbox = options.Mailboxes[index];
             var path = index < options.ConfigurationPaths.Length ? options.ConfigurationPaths[index] : $"Exchange:Mailboxes:{index}";
             failures.AddRange(
-                ExchangeOptionsValidator.GetFailures(mailbox)
+                (localMode ? GetLocalFailures(mailbox) : ExchangeOptionsValidator.GetFailures(mailbox))
                     .Concat(ExchangeOptionsValidator.GetServiceModeFailures(mailbox))
                     .Select(failure => failure.Replace("Exchange:", path + ":", StringComparison.Ordinal)));
 
@@ -37,5 +38,16 @@ public sealed class ExchangeMailboxesOptionsValidator : IValidateOptions<Exchang
         }
 
         return failures.Count == 0 ? ValidateOptionsResult.Success : ValidateOptionsResult.Fail(failures);
+    }
+
+    private static IEnumerable<string> GetLocalFailures(ExchangeOptions mailbox)
+    {
+        var failures = ExchangeOptionsValidator.GetMailboxFailures(mailbox).ToList();
+        if ((mailbox.MoveFolders ?? []).Any(folder => folder is not null && (folder.Trim() is "." or ".." || folder.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)))
+        {
+            failures.Add("Exchange:MoveFolders entries must be valid folder names in local mode.");
+        }
+
+        return failures;
     }
 }

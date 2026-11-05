@@ -4,7 +4,8 @@ using Microsoft.Extensions.Options;
 namespace ExchangeIntegration.Configuration;
 
 /// <summary>Validates <see cref="AzureOptions"/>. Registered only in service mode, so the probe never needs Azure settings.</summary>
-public sealed class AzureOptionsValidator : IValidateOptions<AzureOptions>
+/// <param name="localMode">Local mode (--local) uses no Azure endpoints, only the container and queue names (as folder names).</param>
+public sealed class AzureOptionsValidator(bool localMode = false) : IValidateOptions<AzureOptions>
 {
     // Container and queue names: lowercase letters, digits and single hyphens (the stricter blob container rule).
     private static readonly Regex EntityName = new(
@@ -14,7 +15,7 @@ public sealed class AzureOptionsValidator : IValidateOptions<AzureOptions>
 
     public ValidateOptionsResult Validate(string? name, AzureOptions options)
     {
-        var failures = GetFailures(options);
+        var failures = localMode ? GetNameFailures(options) : GetFailures(options);
         return failures.Count == 0 ? ValidateOptionsResult.Success : ValidateOptionsResult.Fail(failures);
     }
 
@@ -45,6 +46,16 @@ public sealed class AzureOptionsValidator : IValidateOptions<AzureOptions>
             failures.Add("Azure:ServiceBusNamespace is required: the fully qualified host name, for example contoso-invoices.servicebus.windows.net.");
         }
 
+        failures.AddRange(GetNameFailures(options));
+        return failures;
+    }
+
+    /// <summary>The container and queue name checks alone.</summary>
+    public static IReadOnlyList<string> GetNameFailures(AzureOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+
+        var failures = new List<string>();
         CheckName("Azure:IntakeContainer", options.IntakeContainer, failures);
         CheckName("Azure:InvoiceReceivedQueue", options.InvoiceReceivedQueue, failures);
         CheckName("Azure:CommandsQueue", options.CommandsQueue, failures);
